@@ -44,6 +44,7 @@ import xiangshan.TopDownCounters._
 class CtrlToFtqIO(implicit p: Parameters) extends XSBundle {
   val redirect = Valid(new Redirect)
   val ftqIdxAhead = Valid(new FtqPtr)
+  val predTargetRead = Vec(backendParams.BrhCnt, Valid(new FtqPtr))
 
   val resolve = Vec(backendParams.BrhCnt, Valid(new Resolve))
 
@@ -92,7 +93,6 @@ class CtrlBlockImp(
     "memPredStore"  -> 1,
     "robFlush"  -> 1,
     "bjuPc"     -> params.BrhCnt,
-    "bjuTarget" -> params.BrhCnt,
     "load"      -> params.LduCnt,
     "hybrid"    -> params.HyuCnt,
     "store"     -> (if(EnableStorePrefetchSMS) params.StaCnt else 0),
@@ -278,13 +278,11 @@ class CtrlBlockImp(
     io.toDataPath.pcToDataPathIO.toDataPathPC(i) := pcMem.io.rdata(pcMemIdx).unGuard.toUInt
   }
 
-  for ((pcMemIdx, i) <- pcMemRdIndexes("bjuTarget").zipWithIndex) {
-    val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(i)
-    val baseAddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value
-    val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value + 1.U
-    pcMem.io.ren.get(pcMemIdx) := ren
-    pcMem.io.raddr(pcMemIdx) := raddr
-    io.toDataPath.pcToDataPathIO.toDataPathTargetPC(i) := pcMem.io.rdata(pcMemIdx).unGuard.toUInt
+  for (i <- 0 until params.BrhCnt) {
+    io.frontend.toFtq.predTargetRead(i).valid := io.toDataPath.pcToDataPathIO.fromDataPathValid(i)
+    io.frontend.toFtq.predTargetRead(i).bits := io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i)
+    io.toDataPath.pcToDataPathIO.toDataPathTargetPC(i) :=
+      io.frontend.fromFtq.predTargetReadData(i).unGuard.toUInt
   }
 
   val baseIdx = params.BrhCnt

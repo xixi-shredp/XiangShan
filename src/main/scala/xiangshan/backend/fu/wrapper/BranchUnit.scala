@@ -5,6 +5,7 @@ import chisel3._
 import chisel3.util._
 import chisel3.util.log2Up
 import utility.{SignExt, ZeroExt}
+import utility.GTimer
 import xiangshan.backend.decode.ImmUnion
 import xiangshan.backend.fu.{BranchModule, FuConfig, FuncUnit}
 import xiangshan.backend.datapath.DataConfig.VAddrData
@@ -72,6 +73,17 @@ class BranchUnit(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg) {
       redirect.bits.backendIPF := false.B
       redirect.bits.backendIGPF := false.B
       redirect.bits.attribute := io.toFrontendBJUResolve.get.bits.attribute
+  }
+  if (sys.env.get("H2P_HINT_DIAG").contains("1")) {
+    when(io.out.fire && io.out.bits.res.redirect.get.valid) {
+      printf(p"H2P_DIAG_BRANCH cycle=${GTimer()} ftq=${io.in.bits.ctrl.ftqIdx.get.value} " +
+        p"pc=${Hexadecimal(io.in.bits.data.pc.get)} offset=${io.in.bits.ctrl.ftqOffset.get} " +
+        p"pred_target=${Hexadecimal(brhPredictTarget)} " +
+        p"fixed_taken=${io.in.bits.ctrl.predictInfo.get.fixedTaken} pred_taken=${io.in.bits.ctrl.predictInfo.get.predTaken} " +
+        p"actual_target=${Hexadecimal(addModule.io.target)} actual_taken=${dataModule.io.taken} " +
+        p"target_wrong=${targetWrong} need_redirect=${isMisPred} is_mispred=${isMisPred} " +
+        p"attr=${Hexadecimal(io.out.bits.res.redirect.get.bits.attribute.asUInt)}\n")
+    }
   }
   io.toFrontendBJUResolve.get.valid := io.out.valid
   io.toFrontendBJUResolve.get.bits.ftqIdx := io.in.bits.ctrl.ftqIdx.get

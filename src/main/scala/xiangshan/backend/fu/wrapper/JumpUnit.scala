@@ -4,6 +4,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utility.{SignExt, ZeroExt}
+import utility.GTimer
 import xiangshan.RedirectLevel
 import xiangshan.backend.fu.{FuConfig, FuncUnit, JumpDataModule, PipedFuncUnit}
 import xiangshan.JumpOpType
@@ -61,6 +62,17 @@ class JumpUnit(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg)
   redirect.backendIGPF := io.instrAddrTransType.get.checkGuestPageFault(jumpDataModule.io.target)
   redirect.attribute := io.toFrontendBJUResolve.get.bits.attribute
 //  redirect.debug_runahead_checkpoint_id := uop.debugInfo.runahead_checkpoint_id // Todo: assign it
+
+  if (sys.env.get("H2P_HINT_DIAG").contains("1")) {
+    when(io.out.fire && redirectValid) {
+      printf(p"H2P_DIAG_JUMP cycle=${GTimer()} ftq=${io.in.bits.ctrl.ftqIdx.get.value} " +
+        p"pc=${Hexadecimal(io.in.bits.data.pc.get)} offset=${io.in.bits.ctrl.ftqOffset.get} " +
+        p"pred_target=${Hexadecimal(jmpPredictTarget)} fixed_taken=${fixedTaken} pred_taken=${predTaken} " +
+        p"actual_target=${Hexadecimal(jumpDataModule.io.target)} actual_taken=1 " +
+        p"target_wrong=${targetWrong} need_redirect=${needRedirect} need_train=${needTrain} " +
+        p"is_mispred=${redirect.isMisPred} attr=${Hexadecimal(redirect.attribute.asUInt)}\n")
+    }
+  }
 
   io.in.ready := io.out.ready
   io.out.valid := io.in.valid

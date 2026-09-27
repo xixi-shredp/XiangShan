@@ -24,6 +24,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility.DataHoldBypass
+import utility.GTimer
 import utility.HasCircularQueuePtrHelper
 import utility.HasPerfEvents
 import utility.UIntToMask
@@ -196,6 +197,7 @@ class Ftq(implicit p: Parameters) extends FtqModule
       prediction.bits.s3Override -> io.fromBpu.s3FtqPtr
     )
   )
+  private val writeEntry = (prediction.fire || bpuS3Redirect) && !redirect.valid
 
   when(prediction.bits.s3Override) {
     bpuPtr := io.fromBpu.s3FtqPtr + 1.U
@@ -203,8 +205,9 @@ class Ftq(implicit p: Parameters) extends FtqModule
     bpuPtr := bpuPtr + 1.U
   }
 
-  when((prediction.fire || bpuS3Redirect) && !redirect.valid) {
+  when(writeEntry) {
     entryQueue(predictionPtr.value).startPc     := prediction.bits.startPc
+    entryQueue(predictionPtr.value).target      := prediction.bits.target
     entryQueue(predictionPtr.value).taken       := prediction.bits.taken
     entryQueue(predictionPtr.value).endPosition := prediction.bits.endPosition
   }
@@ -268,6 +271,18 @@ class Ftq(implicit p: Parameters) extends FtqModule
       when(fetchPtr >= ftqIdx) {
         fetchPtr := ftqIdx
       }
+    }
+  }
+
+  if (sys.env.get("H2P_HINT_DIAG").contains("1")) {
+    when(bpuS3Redirect) {
+      printf(p"H2P_DIAG_S3 cycle=${GTimer()} ftq=${io.fromBpu.s3FtqPtr.value} " +
+        p"start_pc=${Hexadecimal(prediction.bits.startPc.toUInt)} target=${Hexadecimal(prediction.bits.target.toUInt)} " +
+        p"taken=${prediction.bits.taken} pos=${prediction.bits.endPosition} " +
+        p"prediction_fire=${prediction.fire} backend_redirect=${backendRedirect.valid} ifu_redirect=${ifuRedirect.valid} " +
+        p"ifu_s3_flush=${io.toIfu.flushFromBpu.stage(3).valid} " +
+        p"icache_s3_flush=${io.toICache.flushFromBpu.stage(3).valid} " +
+        p"bpu_ptr=${bpuPtr(0).value} pnr_ptr=${pnrPtr(0).value} pf_ptr=${pfPtr(0).value} fetch_ptr=${fetchPtr(0).value}\n")
     }
   }
 
@@ -352,9 +367,21 @@ class Ftq(implicit p: Parameters) extends FtqModule
   // Interaction with backend
   // --------------------------------------------------------------------------------
 
-  io.toBackend.wen     := (prediction.fire || bpuS3Redirect) && !redirect.valid
+  io.toBackend.wen     := writeEntry
   io.toBackend.ftqIdx  := predictionPtr.value
   io.toBackend.startPc := prediction.bits.startPc
+
+  // BJU issues a request for its own FTQ entry. Capture the target at the request edge
+  // so the response has the same latency as the backend's registered PC read address.
+  // An S3 override may write the requested slot at that edge; return the final target.
+  io.fromBackend.predTargetRead.zip(io.toBackend.predTargetReadData).foreach { case (req, data) =>
+    val target = Mux(
+      writeEntry && predictionPtr === req.bits,
+      prediction.bits.target,
+      entryQueue(req.bits.value).target
+    )
+    data := RegEnable(target, req.valid)
+  }
 
   // --------------------------------------------------------------------------------
   // Redirect from backend and IFU
@@ -379,7 +406,23 @@ class Ftq(implicit p: Parameters) extends FtqModule
   io.toBpu.redirect.bits.taken     := redirect.bits.taken
   io.toBpu.redirect.bits.attribute := redirect.bits.attribute
   io.toBpu.redirect.bits.meta      := RegNext(metaQueueRedirect(redirectFtqIdxInAdvance.value))
+  io.toBpu.redirect.bits.newFtqIdx := redirect.bits.newFtqIdx
+  io.toBpu.redirect.bits.reapply   := redirect.bits.newFtqIdx =/= redirect.bits.ftqIdx
   io.toBpu.redirectFromIFU         := ifuRedirect.valid
+
+  (io.fromBackend.resolve :+ ifuResolve).zip(io.toBpu.hintResolve).foreach { case (src, dst) =>
+    val predicted = entryQueue(src.bits.ftqIdx.value)
+    dst.valid := src.valid
+    dst.bits.ftqPtr := src.bits.ftqIdx
+    dst.bits.cfiPc := getCfiPcFromOffset(src.bits.pc, src.bits.ftqOffset).toUInt.asSInt.pad(64).asUInt
+    dst.bits.target := src.bits.target.toUInt.asSInt.pad(64).asUInt
+    dst.bits.eligible := src.bits.taken && src.bits.attribute.needIttage
+    dst.bits.baselinePc := getCfiPcFromPosition(predicted.startPc, predicted.endPosition).toUInt.asSInt.pad(64).asUInt
+    dst.bits.baselineTarget := predicted.target.toUInt.asSInt.pad(64).asUInt
+    dst.bits.baselineValid := predicted.taken &&
+      dst.bits.baselinePc === dst.bits.cfiPc
+    dst.bits.blockStart := predicted.startPc.toUInt.asSInt.pad(64).asUInt
+  }
 
   resolveQueue.io.backendRedirect    := backendRedirect.valid
   resolveQueue.io.backendRedirectPtr := backendRedirect.bits.ftqIdx
@@ -500,6 +543,9 @@ class Ftq(implicit p: Parameters) extends FtqModule
     commitPtr := commitPtr + 1.U
   }
 
+  io.toBpu.hintCommit.valid := commit
+  io.toBpu.hintCommit.bits := commitPtr(0)
+
   commitQueue.io.backendCommit := io.fromBackend.callRetCommit
 
   io.toBpu.commit.valid                     := commitQueue.io.bpuTrain.valid
@@ -547,6 +593,32 @@ class Ftq(implicit p: Parameters) extends FtqModule
   )._1
   private val redirectPerfMeta = perfQueue(backendRedirect.bits.ftqIdx.value).bpuPerf
   private val commitPerfMeta   = perfQueue(commitPtr(0).value)
+
+  // Elaboration-only diagnostics. The regular RTL has no trace logic or output.
+  if (sys.env.get("H2P_HINT_DIAG").contains("1")) {
+    val actual = backendRedirect.bits
+    val perf = redirectPerfMeta
+    val entry = entryQueue(actual.ftqIdx.value)
+    val allMatch = actual.taken === perf.bpPred.taken &&
+      redirectCfiOffset === perf.bpPred.cfiPosition &&
+      actual.attribute === perf.bpPred.attribute &&
+      actual.target === perf.bpPred.target.toUInt
+    when(backendRedirect.valid) {
+      printf(p"H2P_DIAG_FTQ cycle=${GTimer()} ftq=${actual.ftqIdx.value} pc=${Hexadecimal(actual.pc)} " +
+        p"mispred=${actual.isMisPred} actual_taken=${actual.taken} actual_pos=${redirectCfiOffset} " +
+        p"actual_attr=${Hexadecimal(actual.attribute.asUInt)} actual_target=${Hexadecimal(actual.target)} " +
+        p"final_taken=${perf.bpPred.taken} final_pos=${perf.bpPred.cfiPosition} " +
+        p"final_attr=${Hexadecimal(perf.bpPred.attribute.asUInt)} final_target=${Hexadecimal(perf.bpPred.target.toUInt)} " +
+        p"s1_taken=${perf.s1Prediction.taken} s1_pos=${perf.s1Prediction.cfiPosition} " +
+        p"s1_attr=${Hexadecimal(perf.s1Prediction.attribute.asUInt)} s1_target=${Hexadecimal(perf.s1Prediction.target.toUInt)} " +
+        p"s3_taken=${perf.s3Prediction.taken} s3_pos=${perf.s3Prediction.cfiPosition} " +
+        p"s3_attr=${Hexadecimal(perf.s3Prediction.attribute.asUInt)} s3_target=${Hexadecimal(perf.s3Prediction.target.toUInt)} " +
+        p"s3_override=${perf.bpSource.s3Override} s1_source=${Hexadecimal(perf.bpSource.s1Source.asUInt)} " +
+        p"s3_source=${Hexadecimal(perf.bpSource.s3Source.asUInt)} all_match=${allMatch} " +
+        p"entry_taken=${entry.taken} entry_pos=${entry.endPosition} entry_target=${Hexadecimal(entry.target.toUInt)} " +
+        p"bpu_ptr=${bpuPtr(0).value} fetch_ptr=${fetchPtr(0).value} pnr_ptr=${pnrPtr(0).value}\n")
+    }
+  }
 
   XSPerfSeqAccumulate(
     "squash_cycles_bp_wrong_redirect",

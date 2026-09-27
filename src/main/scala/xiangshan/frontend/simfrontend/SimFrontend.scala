@@ -47,7 +47,8 @@ import xiangshan.frontend.ifu._
  * However, in most cases, when the backend executes/submits commands slowly, it causes a false ftq full condition.
  * This prevents sending all 8 commands within a cycle, limiting transmission to only the commands stored in the false ftq.
  */
-class SimFrontFetchHelper extends ExtModule() with HasExtModuleInline {
+class SimFrontFetchHelper(val numTargetReadPorts: Int) extends ExtModule() with HasExtModuleInline {
+  require(numTargetReadPorts > 0)
   val clock = IO(Input(Clock()))
   val reset = IO(Input(Reset()))
   val io = IO(new Bundle {
@@ -67,6 +68,11 @@ class SimFrontFetchHelper extends ExtModule() with HasExtModuleInline {
 
     val out_ftqPackData = Output(UInt(32.W))
     val out_ftqPc       = Output(UInt(64.W))
+
+    val predTargetReadValid = Input(Vec(numTargetReadPorts, Bool()))
+    val predTargetReadFlag  = Input(Vec(numTargetReadPorts, Bool()))
+    val predTargetReadValue = Input(Vec(numTargetReadPorts, UInt(6.W)))
+    val out_predTarget      = Output(Vec(numTargetReadPorts, UInt(64.W)))
 
     val updatePtrCount = Input(UInt(32.W))
 
@@ -108,6 +114,13 @@ class SimFrontFetchHelper extends ExtModule() with HasExtModuleInline {
     "  output int pack_data,",
     "  output longint newest_pc,",
     "  output int newest_pack_data,",
+    ");",
+    "",
+    "import \"DPI-C\" function void SimFrontGetFtqPredTarget (",
+    "  input int valid,",
+    "  input int ftq_flag,",
+    "  input int ftq_value,",
+    "  output longint target_pc",
     ");",
     "",
     "import \"DPI-C\" function void SimFrontRobCommit (",
@@ -158,7 +171,15 @@ class SimFrontFetchHelper extends ExtModule() with HasExtModuleInline {
     "  input  [5:0]  io_redirectFtqValue,",
     "  input  [31:0] io_redirectType,",
     "  input  [63:0] io_redirectPc,",
-    "  input  [63:0] io_redirectTarget",
+    "  input  [63:0] io_redirectTarget,"
+  ) ++ (0 until numTargetReadPorts).flatMap { i =>
+    Seq(
+      s"  input         io_predTargetReadValid_$i,",
+      s"  input         io_predTargetReadFlag_$i,",
+      s"  input  [5:0]  io_predTargetReadValue_$i,",
+      s"  output [63:0] io_out_predTarget_$i${if (i == numTargetReadPorts - 1) "" else ","}"
+    )
+  } ++ Seq(
     ");",
     "",
     "",
@@ -178,6 +199,10 @@ class SimFrontFetchHelper extends ExtModule() with HasExtModuleInline {
     "    SimFrontFetch(7, io_out_7_pc, io_out_7_instr, io_out_7_preDecode);",
     "",
     "    SimFrontGetFtqToBackEnd(io_out_ftqPc, io_out_ftqPackData, io_out_newestPc, io_out_newestPreDecode);",
+    ""
+  ) ++ (0 until numTargetReadPorts).map { i =>
+    s"    SimFrontGetFtqPredTarget(io_predTargetReadValid_$i, io_predTargetReadFlag_$i, io_predTargetReadValue_$i, io_out_predTarget_$i);"
+  } ++ Seq(
     "",
     "    SimFrontRobCommit(io_robCommitValid, io_robCommitFtqFlag, io_robCommitFtqValue);",
     "  end",
@@ -195,7 +220,7 @@ class SimFrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBa
   instrUncache.io <> WireDefault(0.U.asTypeOf(instrUncache.io))
   io <> WireDefault(0.U.asTypeOf(io))
 
-  val fetchHelper = Module(new SimFrontFetchHelper)
+  val fetchHelper = Module(new SimFrontFetchHelper(backendParams.BrhCnt))
 
   val readyCount = Mux(io.backend.toIBuf.decodeCanAccept, PopCount(io.backend.cfVec.map(_.ready)), 0.U)
 
@@ -268,6 +293,15 @@ class SimFrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBa
   io.backend.fromFtq.wen     := fetchHelper.io.out_ftqPackData(6)
   io.backend.fromFtq.ftqIdx  := fetchHelper.io.out_ftqPackData(5, 0)
   io.backend.fromFtq.startPc := GuardedPcInit(fetchHelper.io.out_ftqPc(GuardedVAddrBits - 1, 0))
+
+  for (i <- 0 until backendParams.BrhCnt) {
+    val read = io.backend.toFtq.predTargetRead(i)
+    fetchHelper.io.predTargetReadValid(i) := read.valid
+    fetchHelper.io.predTargetReadFlag(i)  := read.bits.flag
+    fetchHelper.io.predTargetReadValue(i) := read.bits.value
+    io.backend.fromFtq.predTargetReadData(i) :=
+      GuardedPcInit(fetchHelper.io.out_predTarget(i)(GuardedVAddrBits - 1, 0))
+  }
 
   XSPerfAccumulate("all_redirect", io.backend.toFtq.redirect.valid)
   XSPerfAccumulate("mispred_redirect", io.backend.toFtq.redirect.valid && io.backend.toFtq.redirect.bits.isMisPred)

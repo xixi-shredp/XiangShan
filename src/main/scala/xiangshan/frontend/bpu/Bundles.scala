@@ -36,6 +36,8 @@ import xiangshan.frontend.bpu.sc.ScMeta
 import xiangshan.frontend.bpu.tage.TageMeta
 import xiangshan.frontend.bpu.utage.MicroTageMeta
 import xiangshan.frontend.ftq.ResolveSource
+import xiangshan.frontend.ftq.FtqPtr
+import xiangshan.frontend.bpu.hint.HintSnapshot
 
 /* *** public const & type *** */
 class BranchAttribute extends Bundle {
@@ -156,6 +158,7 @@ class BpuPredictionSource extends Bundle {
   def s1Fallthrough: Bool = s1Source === BpuPredictionSource.Stage1.Fallthrough
   def s3Ras:         Bool = s3Source === BpuPredictionSource.Stage3.Ras
   def s3ITTage:      Bool = s3Source === BpuPredictionSource.Stage3.ITTage
+  def s3Hint:        Bool = s3Source === BpuPredictionSource.Stage3.Hint
   def s3Sc:          Bool = s3Source === BpuPredictionSource.Stage3.Sc
   def s3Tage:        Bool = s3Source === BpuPredictionSource.Stage3.Tage
   def s3Mbtb:        Bool = s3Source === BpuPredictionSource.Stage3.Mbtb
@@ -170,13 +173,14 @@ object BpuPredictionSource {
     def AbtbUtage:   UInt = 3.U(width.W)
     def Fallthrough: UInt = 4.U(width.W)
   }
-  object Stage3 extends EnumUInt(6) {
+  object Stage3 extends EnumUInt(7) {
     def Ras:         UInt = 0.U(width.W)
     def ITTage:      UInt = 1.U(width.W)
     def Sc:          UInt = 2.U(width.W)
     def Tage:        UInt = 3.U(width.W)
     def Mbtb:        UInt = 4.U(width.W)
     def Fallthrough: UInt = 5.U(width.W)
+    def Hint:        UInt = 6.U(width.W)
   }
 }
 
@@ -220,6 +224,8 @@ class BpuRedirect(implicit p: Parameters) extends BpuBundle {
   val taken:     Bool            = Bool()
   val attribute: BranchAttribute = new BranchAttribute
   val meta:      BpuRedirectMeta = new BpuRedirectMeta
+  val newFtqIdx: FtqPtr = new FtqPtr
+  val reapply: Bool = Bool()
 }
 
 class BranchInfo(implicit p: Parameters) extends BpuBundle with HalfAlignHelper {
@@ -316,6 +322,7 @@ class BpuRedirectMeta(implicit p: Parameters) extends BpuBundle {
   val phr:          PhrMeta         = new PhrMeta
   val commonHRMeta: CommonHRMeta    = new CommonHRMeta
   val ras:          RasRedirectMeta = new RasRedirectMeta
+  val hint:         HintSnapshot = new HintSnapshot
 }
 
 // metadata for resolve training (e.g. tage, mainBtb)

@@ -68,6 +68,9 @@ import xiangshan.frontend.icache.ICache
 import xiangshan.frontend.ifu.Ifu
 import xiangshan.frontend.instruncache.InstrUncache
 import xiangshan.frontend.simfrontend.SimFrontendInlinedImp
+import xiangshan.frontend.bpu.hint.HintDpi
+import xiangshan.frontend.bpu.hint.HintProfileDpi
+import xiangshan.frontend.bpu.hint.HintReplayDpi
 
 class FrontendIO(implicit p: Parameters) extends FrontendBundle {
   val hartId:       UInt             = Input(UInt(hartIdLen.W))
@@ -152,6 +155,52 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
   // bpu ctrl
   bpu.io.ctrl        := csrCtrl.bp_ctrl
   bpu.io.resetVector := io.reset_vector
+  if (!p(DebugOptionsKey).FPGAPlatform) {
+    val hintDpi = Module(new HintDpi)
+    hintDpi.io.clock := clock
+    hintDpi.io.reset := reset.asBool
+    hintDpi.io.loadReady := bpu.io.hintLoad.ready
+    hintDpi.io.stats := bpu.io.hintStats
+    bpu.io.hintLoad.valid := hintDpi.io.loadValid
+    bpu.io.hintLoad.bits.kind := hintDpi.io.loadKind
+    bpu.io.hintLoad.bits.index := hintDpi.io.loadIndex
+    bpu.io.hintLoad.bits.data := hintDpi.io.loadData
+    bpu.io.hintEnabled := hintDpi.io.enabled
+    bpu.io.hintProfile := hintDpi.io.profile
+    bpu.io.hintMeasureActive := hintDpi.io.measure
+    val hintProfileDpi = Module(new HintProfileDpi)
+    hintProfileDpi.io.clock := clock
+    hintProfileDpi.io.valid := bpu.io.hintProfileEvent.valid
+    hintProfileDpi.io.pc := bpu.io.hintProfileEvent.bits.pc
+    hintProfileDpi.io.actual := bpu.io.hintProfileEvent.bits.actual
+    hintProfileDpi.io.baselinePc := bpu.io.hintProfileEvent.bits.baselinePc
+    hintProfileDpi.io.baselineTarget := bpu.io.hintProfileEvent.bits.baselineTarget
+    hintProfileDpi.io.baselineValid := bpu.io.hintProfileEvent.bits.baselineValid
+    hintProfileDpi.io.blockStart := bpu.io.hintProfileEvent.bits.blockStart
+    hintProfileDpi.io.queryCycle := bpu.io.hintProfileEvent.bits.queryCycle
+    hintProfileDpi.io.ith := bpu.io.hintProfileEvent.bits.ith
+    hintProfileDpi.io.lhr := bpu.io.hintProfileEvent.bits.lhr
+    hintProfileDpi.io.call := bpu.io.hintProfileEvent.bits.call
+    hintProfileDpi.io.ret := bpu.io.hintProfileEvent.bits.ret
+    hintProfileDpi.io.eligible := bpu.io.hintProfileEvent.bits.eligible
+    hintProfileDpi.io.observed := bpu.io.hintProfileEvent.bits.observed
+    val hintReplayDpi = Module(new HintReplayDpi)
+    hintReplayDpi.io.clock := clock
+    hintReplayDpi.io.valid := bpu.io.hintReplayEvent.valid
+    hintReplayDpi.io.pc := bpu.io.hintReplayEvent.bits.pc
+    hintReplayDpi.io.actual := bpu.io.hintReplayEvent.bits.actual
+    hintReplayDpi.io.baselineTarget := bpu.io.hintReplayEvent.bits.baselineTarget
+    hintReplayDpi.io.finalTarget := bpu.io.hintReplayEvent.bits.finalTarget
+    hintReplayDpi.io.usedHint := bpu.io.hintReplayEvent.bits.usedHint
+    hintReplayDpi.io.contextHit := bpu.io.hintReplayEvent.bits.contextHit
+    hintReplayDpi.io.confAtPrediction := bpu.io.hintReplayEvent.bits.confAtPrediction
+  } else {
+    bpu.io.hintLoad.valid := false.B
+    bpu.io.hintLoad.bits := 0.U.asTypeOf(bpu.io.hintLoad.bits)
+    bpu.io.hintEnabled := false.B
+    bpu.io.hintProfile := false.B
+    bpu.io.hintMeasureActive := false.B
+  }
 
   // pmp
   private val pmp = Module(new PMP)

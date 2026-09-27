@@ -34,6 +34,7 @@ import xiangshan.frontend.icache.PrefetchReqBundle
 
 class FtqEntry(implicit p: Parameters) extends FtqBundle {
   val startPc:     GuardedPc = GuardedPc()
+  val target:      GuardedPc = GuardedPc()
   val taken:       Bool      = Bool()
   val endPosition: UInt      = UInt(CfiPositionWidth.W)
 }
@@ -92,6 +93,9 @@ class FtqToCtrlIO(implicit p: Parameters) extends FtqBundle {
   val wen:     Bool      = Output(Bool())
   val ftqIdx:  UInt      = Output(UInt(FtqPtr.width.W))
   val startPc: GuardedPc = Output(GuardedPc())
+
+  // One-cycle response to CtrlToFtqIO.predTargetRead, sourced from the current FTQ entry.
+  val predTargetReadData: Vec[GuardedPc] = Output(Vec(backendParams.BrhCnt, GuardedPc()))
 }
 
 class PerfMeta(implicit p: Parameters) extends FtqBundle {
