@@ -126,6 +126,9 @@ class Ftq(implicit p: Parameters) extends FtqModule
 
   // perfQueue stores information for performance monitoring. These queues should not exist in hardware
   private val perfQueue = Reg(Vec(FtqSize, new PerfMeta))
+  // These generation checks observe the existing sim perfQueue; no prediction guard/storage.
+  private val debugPerfGeneration = Option.when(!env.FPGAPlatform)(Reg(Vec(FtqSize, new FtqPtr)))
+  private val debugPerfValid = Option.when(!env.FPGAPlatform)(RegInit(VecInit(Seq.fill(FtqSize)(false.B))))
 
   private val (backendRedirectFtqIdxInAdvance, backendRedirect) = receiveBackendRedirect(io.fromBackend)
 
@@ -220,6 +223,8 @@ class Ftq(implicit p: Parameters) extends FtqModule
     metaQueueCommit(s3BpuPtr)   := io.fromBpu.meta.bits.commitMeta
 
     s3PerfQueue(s3BpuPtr).bpuPerf := io.fromBpu.perfMeta
+    debugPerfGeneration.foreach(_(s3BpuPtr) := io.fromBpu.s3FtqPtr)
+    debugPerfValid.foreach(_(s3BpuPtr) := true.B)
     s3PerfQueue(s3BpuPtr).isCfi.foreach(_ := false.B)
     s3PerfQueue(s3BpuPtr).mispredict := false.B
   }
@@ -410,7 +415,7 @@ class Ftq(implicit p: Parameters) extends FtqModule
   io.toBpu.redirect.bits.reapply   := redirect.bits.newFtqIdx =/= redirect.bits.ftqIdx
   io.toBpu.redirectFromIFU         := ifuRedirect.valid
 
-  (io.fromBackend.resolve :+ ifuResolve).zip(io.toBpu.hintResolve).foreach { case (src, dst) =>
+  (io.fromBackend.resolve :+ ifuResolve).zip(io.toBpu.hintResolve).zipWithIndex.foreach { case ((src, dst), sourceIndex) =>
     val predicted = entryQueue(src.bits.ftqIdx.value)
     dst.valid := src.valid
     dst.bits.ftqPtr := src.bits.ftqIdx
@@ -422,6 +427,9 @@ class Ftq(implicit p: Parameters) extends FtqModule
     dst.bits.baselineValid := predicted.taken &&
       dst.bits.baselinePc === dst.bits.cfiPc
     dst.bits.blockStart := predicted.startPc.toUInt.asSInt.pad(64).asUInt
+    dst.bits.offset := src.bits.ftqOffset
+    dst.bits.mispredict := src.bits.mispredict
+    dst.bits.sourceBackend := (sourceIndex < io.fromBackend.resolve.length).B
   }
 
   resolveQueue.io.backendRedirect    := backendRedirect.valid
@@ -516,6 +524,8 @@ class Ftq(implicit p: Parameters) extends FtqModule
       when(beforeKnownMispredict) {
         curPerfMeta.isCfi(newBranchInfo.cfiPosition)   := true.B
         curPerfMeta.cfiAttr(newBranchInfo.cfiPosition) := newBranchInfo.attribute
+        curPerfMeta.debug_actualTarget.foreach(_(newBranchInfo.cfiPosition) := branch.bits.target.toUInt)
+        curPerfMeta.debug_actualPc.foreach(_(newBranchInfo.cfiPosition) := newBranchInfo.debug_realCfiPc.get)
         when(branch.bits.mispredict) {
           curPerfMeta.mispredict           := true.B
           curPerfMeta.mispredictBranchInfo := newBranchInfo
@@ -593,6 +603,51 @@ class Ftq(implicit p: Parameters) extends FtqModule
   )._1
   private val redirectPerfMeta = perfQueue(backendRedirect.bits.ftqIdx.value).bpuPerf
   private val commitPerfMeta   = perfQueue(commitPtr(0).value)
+
+  if (!env.FPGAPlatform) {
+    // Sample each actual ROB retirement, without waiting for FTQ block reclamation.
+    // FTQ metadata is still resident; full ptr generation + exact decoded PC/offset are checked.
+    for (retired <- io.fromBackend.debugRetired.get) {
+      val meta = perfQueue(retired.bits.ftqPtr.value)
+      val (position, carry) = getAlignedPosition(entryQueue(retired.bits.ftqPtr.value).startPc,
+        retired.bits.ftqOffset)
+      val observedAttribute = BranchAttribute.decode(retired.bits.instr, retired.valid)
+      val realPc = getRealCfiPcFromOffset(entryQueue(retired.bits.ftqPtr.value).startPc,
+        retired.bits.ftqOffset, retired.bits.isRVC).asSInt.pad(64).asUInt
+      val observer = Module(new CommittedIndirectDpi)
+      observer.clock := clock
+      observer.io.valid := !reset.asBool && retired.valid && observedAttribute.needIttage
+      observer.io.metadataValid := debugPerfValid.get(retired.bits.ftqPtr.value) &&
+        debugPerfGeneration.get(retired.bits.ftqPtr.value) === retired.bits.ftqPtr &&
+        !carry && meta.isCfi(position) && meta.cfiAttr(position).needIttage &&
+        meta.debug_actualPc.get(position).asSInt.pad(64).asUInt === retired.bits.pc &&
+        realPc === retired.bits.pc
+      observer.io.pc := retired.bits.pc
+      observer.io.actual := meta.debug_actualTarget.get(position).asSInt.pad(64).asUInt
+      observer.io.ordinal := retired.bits.ordinal
+      observer.io.instr := retired.bits.instr
+      observer.io.ftqTag := retired.bits.ftqPtr.asUInt
+      observer.io.offset := retired.bits.ftqOffset
+      observer.io.queryCycle := meta.bpuPerf.debug_hintQueryCycle.get
+      val finalPred = meta.bpuPerf.bpPred
+      val baselinePred = meta.bpuPerf.debug_preHintPrediction.get
+      observer.io.baselineTarget := baselinePred.target.toUInt.asSInt.pad(64).asUInt
+      observer.io.baselineValid := baselinePred.taken && baselinePred.cfiPosition === position && baselinePred.attribute.needIttage
+      observer.io.finalTarget := finalPred.target.toUInt.asSInt.pad(64).asUInt
+      observer.io.finalValid := finalPred.taken && finalPred.cfiPosition === position && finalPred.attribute.needIttage
+      observer.io.usedHint := meta.bpuPerf.debug_usedHint.get &&
+        meta.bpuPerf.bpSource.s3Override && observer.io.finalValid
+      when(observer.io.valid && !observer.io.metadataValid) {
+        printf(p"ROB_TARGET_METADATA_DIAG ordinal=${retired.bits.ordinal} pc=${Hexadecimal(retired.bits.pc)} " +
+          p"instr=${Hexadecimal(retired.bits.instr)} ftq=${retired.bits.ftqPtr.asUInt} offset=${retired.bits.ftqOffset} " +
+          p"valid=${debugPerfValid.get(retired.bits.ftqPtr.value)} generation=${debugPerfGeneration.get(retired.bits.ftqPtr.value).asUInt} " +
+          p"start=${Hexadecimal(entryQueue(retired.bits.ftqPtr.value).startPc.toUInt)} position=${position} carry=${carry} " +
+          p"isRVC=${retired.bits.isRVC} realPc=${Hexadecimal(realPc)} isCfi=${meta.isCfi(position)} " +
+          p"needIttage=${meta.cfiAttr(position).needIttage} actualPc=${Hexadecimal(meta.debug_actualPc.get(position))} " +
+          p"actualTarget=${Hexadecimal(meta.debug_actualTarget.get(position))}\n")
+      }
+    }
+  }
 
   // Elaboration-only diagnostics. The regular RTL has no trace logic or output.
   if (sys.env.get("H2P_HINT_DIAG").contains("1")) {

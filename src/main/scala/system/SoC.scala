@@ -40,6 +40,8 @@ import device.SYSCNTConsts.timeWidth
 
 case object SoCParamsKey extends Field[SoCParameters]
 case object CVMParamsKey extends Field[CVMParameters]
+// A single coherent requester, with no persistent home cache or directory.
+case object EnableCachelessCHIHome extends Field[Boolean](false)
 
 case class CVMParameters
 (

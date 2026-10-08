@@ -1023,9 +1023,9 @@ class NewCSR(implicit val p: Parameters) extends Module
 
   val triggerFrontendChange = Wire(Bool())
 
-  val vstartChange = vstart.w.wen && (
-    vstart.w.wdata === 0.U && vstart.regOut.vstart.asUInt =/= 0.U ||
-    vstart.w.wdata =/= 0.U && vstart.regOut.vstart.asUInt === 0.U
+  val vstartChange = vstart.map(_.w.wen).getOrElse(false.B) && (
+    vstart.map(_.w.wdata).getOrElse(0.U) === 0.U && vstart.map(_.regOut.vstart.asUInt).getOrElse(0.U) =/= 0.U ||
+    vstart.map(_.w.wdata).getOrElse(0.U) =/= 0.U && vstart.map(_.regOut.vstart.asUInt).getOrElse(0.U) === 0.U
   )
 
   // flush pipe when write frm and data > 4 or write fcsr and data[7:5] > 4 or write frm/fcsr and frm is reserved
@@ -1168,13 +1168,13 @@ class NewCSR(implicit val p: Parameters) extends Module
   io.status.privState := privState
   io.status.fpState.frm := fcsr.frm
   io.status.fpState.off := mstatus.regOut.FS === ContextStatus.Off
-  io.status.vecState.vstart := vstart.rdata.asUInt
-  io.status.vecState.vxsat := vcsr.vxsat
-  io.status.vecState.vxrm := vcsr.vxrm
-  io.status.vecState.vcsr := vcsr.rdata.asUInt
-  io.status.vecState.vl := vl.rdata.asUInt
-  io.status.vecState.vtype := vtype.rdata.asUInt // Todo: check correct
-  io.status.vecState.vlenb := vlenb.rdata.asUInt
+  io.status.vecState.vstart := vstart.map(_.rdata.asUInt).getOrElse(0.U)
+  io.status.vecState.vxsat := vcsr.map(_.vxsat).getOrElse(0.U)
+  io.status.vecState.vxrm := vcsr.map(_.vxrm).getOrElse(0.U)
+  io.status.vecState.vcsr := vcsr.map(_.rdata.asUInt).getOrElse(0.U)
+  io.status.vecState.vl := vl.map(_.rdata.asUInt).getOrElse(0.U)
+  io.status.vecState.vtype := vtype.map(_.rdata.asUInt).getOrElse(0.U) // Todo: check correct
+  io.status.vecState.vlenb := vlenb.map(_.rdata.asUInt).getOrElse(0.U)
   io.status.vecState.off := mstatus.regOut.VS === ContextStatus.Off
   io.status.interrupt := intrMod.io.out.interruptVec.valid
   io.status.wfiEvent := debugIntr || nmip.asUInt.orR ||
@@ -1725,15 +1725,18 @@ class NewCSR(implicit val p: Parameters) extends Module
     diffTriggerCSRState.tdata1    := tdata1.rdata
     diffTriggerCSRState.tinfo     := tinfo.rdata
 
+    if (HasVPU) {
     val diffVecCSRState = DifftestModule(new DiffVecCSRState)
     diffVecCSRState.coreid := hartId
-    diffVecCSRState.vstart := vstart.rdata.asUInt
-    diffVecCSRState.vxsat := vcsr.vxsat.asUInt
-    diffVecCSRState.vxrm := vcsr.vxrm.asUInt
-    diffVecCSRState.vcsr := vcsr.rdata.asUInt
+    diffVecCSRState.vstart := vstart.map(_.rdata.asUInt).getOrElse(0.U)
+    diffVecCSRState.vxsat := vcsr.map(_.vxsat.asUInt).getOrElse(0.U)
+    diffVecCSRState.vxrm := vcsr.map(_.vxrm.asUInt).getOrElse(0.U)
+    diffVecCSRState.vcsr := vcsr.map(_.rdata.asUInt).getOrElse(0.U)
     diffVecCSRState.vl := DelayN(io.fromRob.commit.vl, 2)
-    diffVecCSRState.vtype := vtype.rdata.asUInt
-    diffVecCSRState.vlenb := vlenb.rdata.asUInt
+    diffVecCSRState.vtype := vtype.map(_.rdata.asUInt).getOrElse(0.U)
+    diffVecCSRState.vlenb := vlenb.map(_.rdata.asUInt).getOrElse(0.U)
+
+    }
 
     val diffFpCSRState = DifftestModule(new DiffFpCSRState)
     diffFpCSRState.coreid := hartId

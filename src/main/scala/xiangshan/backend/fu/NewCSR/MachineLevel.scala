@@ -52,7 +52,7 @@ trait MachineLevel { self: NewCSR =>
   val mstatus = Module(new MstatusModule)
     .setAddr(CSRs.mstatus)
 
-  val misa = Module(new CSRModule("Misa", new MisaBundle))
+  val misa = Module(new CSRModule("Misa", new MisaBundle(HasVPU)))
     .setAddr(CSRs.misa)
 
   println(s"[CSR] supported isa ext: ${misa.bundle.getISAString}")
@@ -616,6 +616,7 @@ class MstatusModule(implicit override val p: Parameters) extends CSRModule("MSta
     assert(reg.VS =/= ContextStatus.Off, "The [m|s]status.VS should not be Off when set dirty, please check decode")
     reg.VS := ContextStatus.Dirty
   }
+  if (!p(xiangshan.XSCoreParamsKey).HasVPU) { reg.VS := ContextStatus.Off; regOut.VS := ContextStatus.Off }
   // when MDT is explicitly written by 1, clear MIE
   // only when reg.MDT is zero or wdata.MDT is zero , MIE can be explicitly written by 1
   when (w.wdataFields.MDT && w.wen) {
@@ -654,7 +655,7 @@ class MnstatusBundle extends CSRBundle {
   val MNPP   = PrivMode    (12, 11).withReset(PrivMode.U).withDescription("Saved privilege level for resumable NMI handling.")
 }
 
-class MisaBundle extends CSRBundle {
+class MisaBundle(hasVector: Boolean = true) extends CSRBundle {
   // Todo: reset with ISA string
   val A = RO( 0).withReset(1.U).withDescription("Atomic extension supported.")
   val B = RO( 1).withReset(1.U).withDescription("Bit-manipulation extension supported.")
@@ -677,7 +678,7 @@ class MisaBundle extends CSRBundle {
   val S = RO(18).withReset(1.U).withDescription("Supervisor mode supported.")
   val T = RO(19).withReset(0.U).withDescription("Reserved extension bit T.")
   val U = RO(20).withReset(1.U).withDescription("User mode supported.")
-  val V = RO(21).withReset(1.U).withDescription("Vector extension supported.")
+  val V = RO(21).withReset(hasVector.B.asUInt).withDescription("Vector extension supported.")
   val W = RO(22).withReset(0.U).withDescription("Reserved extension bit W.")
   val X = RO(23).withReset(0.U).withDescription("Non-standard extensions implemented.")
   val Y = RO(24).withReset(0.U).withDescription("Reserved extension bit Y.")

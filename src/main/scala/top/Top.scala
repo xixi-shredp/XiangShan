@@ -84,6 +84,11 @@ trait HasDTSImp[+L <: BaseXSSoc] { this: LazyRawModuleImp =>
 
 class XSTop()(implicit p: Parameters) extends BaseXSSoc()
 {
+  private val cachelessHome = p(EnableCachelessCHIHome)
+  require(!cachelessHome || (enableCHI && NumCores == 1),
+    "cacheless CHI home supports one coherent L2 requester and its bank-encoded TxnIDs")
+  require(!cachelessHome || soc.OpenLLCParamsOpt.isEmpty,
+    "cacheless CHI home must not instantiate an LLC")
   val nocMisc = if (enableCHI) Some(LazyModule(new MemMisc())) else None
   val socMisc = if (!enableCHI) Some(LazyModule(new SoCMisc())) else None
   val misc: MemMisc = if (enableCHI) nocMisc.get else socMisc.get
@@ -105,11 +110,14 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc()
     LazyModule(new OpenNCB()(p.alter((site, here, up) => {
       case NCBParametersKey => new NCBParameters(
         outstandingDepth    = 64,
-        axiMasterOrder      = EnumAXIMasterOrder.WriteAddress,
+        // With no resident home cache, Comp must follow the endpoint AXI B.
+        axiMasterOrder      = if (cachelessHome) EnumAXIMasterOrder.None else EnumAXIMasterOrder.WriteAddress,
         readCompDMT         = false,
         writeCancelable     = false,
+        writeCompPreferSeperate = cachelessHome,
         writeNoError        = true,
         axiBurstAlwaysIncr  = true,
+        acceptMemAttrDevice = cachelessHome,
         chiDataCheck        = EnumCHIDataCheck.OddParity
       )
     })))
@@ -293,7 +301,7 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc()
 
     val reset_sync = withClockAndReset(io.clock, io.reset) { ResetGen() }
     val jtag_reset_sync = withClockAndReset(io.systemjtag.jtag.TCK, io.systemjtag.reset) { ResetGen() }
-    val chi_openllc_opt = Option.when(enableCHI)(
+    val chi_openllc_opt = Option.when(enableCHI && !cachelessHome)(
       withClockAndReset(io.clock, io.reset) {
         Module(new OpenLLC()(p.alter((site, here, up) => {
           case OpenLLCParamKey => soc.OpenLLCParamsOpt.get.copy(
@@ -301,6 +309,19 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc()
             FPGAPlatform = debugOpts.FPGAPlatform
           )
         })))
+      }
+    )
+    val chi_cachelessHome_opt = Option.when(enableCHI && cachelessHome)(
+      withClockAndReset(io.clock, io.reset) {
+        val l2 = tiles.head.L2CacheParamsOpt.get
+        val cacheTransactions = tiles.head.L2NBanks * l2.mshrs
+        require(l2.supportSeparateWriteCompletion,
+          "cacheless home requires L2 DBID credit separated from endpoint write completion")
+        Module(new CachelessCHIHome(CachelessCHIHomeParams(
+          ordinaryEntries = cacheTransactions + l2.mmioBridgeSize,
+          releaseEntries = cacheTransactions,
+          downstreamEntries = 64
+        )))
       }
     )
 
@@ -421,21 +442,24 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc()
             Map((NumCores + i) -> mmioLogger.io.up, (NumCores * 2) -> llcLogger.io.up)
           )
           chi_mmioBridge_opt(i).get.module.io.chi.connect(mmioLogger.io.down)
-          chi_openllc_opt.get.io.rn(i) <> llcLogger.io.down
+          chi_openllc_opt.foreach(_.io.rn(i) <> llcLogger.io.down)
+          chi_cachelessHome_opt.foreach(_.io.rn <> llcLogger.io.down)
           require(core.module.io.chi.get.getWidth == llcLogger.io.up.getWidth)
-          require(llcLogger.io.down.getWidth == chi_openllc_opt.get.io.rn(i).getWidth)
+          chi_openllc_opt.foreach(l3 => require(llcLogger.io.down.getWidth == l3.io.rn(i).getWidth))
+          chi_cachelessHome_opt.foreach(home => require(llcLogger.io.down.getWidth == home.io.rn.getWidth))
         }
         val memLogger = CHILogger(s"LLC_MEM", true)
-        chi_openllc_opt.get.io.sn.connect(memLogger.io.up)
+        chi_openllc_opt.foreach(_.io.sn.connect(memLogger.io.up))
+        chi_cachelessHome_opt.foreach(_.io.sn.connect(memLogger.io.up))
         chi_llcBridge_opt.get.module.io.chi.connect(memLogger.io.down)
-        chi_openllc_opt.get.io.nodeID := (NumCores * 2).U
+        chi_openllc_opt.foreach(_.io.nodeID := (NumCores * 2).U)
+        chi_cachelessHome_opt.foreach { home =>
+          home.io.nodeID := (NumCores * 2).U
+          home.io.snNodeID := 0.U
+        }
         chi_openllc_opt.foreach { l3 =>
           l3.io.debugTopDown.robHeadPaddr := core_with_l2.map(_.module.io.debugTopDown.robHeadPaddr)
         }
-        core_with_l2.zip(chi_openllc_opt.get.io.debugTopDown.addrMatch).foreach { case (tile, l3Match) =>
-          tile.module.io.debugTopDown.l3MissMatch := l3Match
-        }
-        core_with_l2.map(_.module.io.l3Miss := (if (chi_openllc_opt.nonEmpty) chi_openllc_opt.get.io.l3Miss else false.B))
       }
     }
 

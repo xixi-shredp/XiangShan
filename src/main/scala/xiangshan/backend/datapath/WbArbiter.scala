@@ -92,7 +92,7 @@ class WbDataPathIO()(implicit p: Parameters, params: BackendParams, schdParams: 
 
   val fromFpExu: MixedVec[MixedVec[DecoupledIO[NewExuOutput]]] = Flipped(params.fpSchdParams.get.genNewExuOutputDecoupledBundle)
 
-  val fromVfExu: MixedVec[MixedVec[DecoupledIO[NewExuOutput]]] = Flipped(params.vecSchdParams.get.genNewExuOutputDecoupledBundle)
+  val fromVfExu: MixedVec[MixedVec[DecoupledIO[NewExuOutput]]] = Flipped(params.vecInterfaceParams.genNewExuOutputDecoupledBundle)
 
   val fromCSR = Input(new Bundle {
     val vstart = Vstart()
@@ -292,14 +292,23 @@ class WbDataPath(params: BackendParams, schdParams: SchdBlockParams)(implicit p:
   // wb arbiter
   private val intWbArbiter = Module(new RealWBCollideChecker(params.getIntWbArbiterParams))
   private val fpWbArbiter = Module(new RealWBCollideChecker(params.getFpWbArbiterParams))
-  private val vfWbArbiter = Module(new RealWBCollideChecker(params.getVfWbArbiterParams))
-  private val v0WbArbiter = Module(new RealWBCollideChecker(params.getV0WbArbiterParams))
-  private val vlWbArbiter = Module(new RealWBCollideChecker(params.getVlWbArbiterParams))
+  private val vfWbArbiterIO = if (HasVPU) Module(new RealWBCollideChecker(params.getVfWbArbiterParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new WbArbiterIO()(p, params.getVfWbArbiterParams)))
+    ports
+  }
+  private val v0WbArbiterIO = if (HasVPU) Module(new RealWBCollideChecker(params.getV0WbArbiterParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new WbArbiterIO()(p, params.getV0WbArbiterParams)))
+    ports
+  }
+  private val vlWbArbiterIO = if (HasVPU) Module(new RealWBCollideChecker(params.getVlWbArbiterParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new WbArbiterIO()(p, params.getVlWbArbiterParams)))
+    ports
+  }
   println(s"[WbDataPath] int preg write back port num: ${intWbArbiter.io.out.size}, active port: ${intWbArbiter.io.inGroup.keys.toSeq.sorted}")
   println(s"[WbDataPath] fp preg write back port num: ${fpWbArbiter.io.out.size}, active port: ${fpWbArbiter.io.inGroup.keys.toSeq.sorted}")
-  println(s"[WbDataPath] vf preg write back port num: ${vfWbArbiter.io.out.size}, active port: ${vfWbArbiter.io.inGroup.keys.toSeq.sorted}")
-  println(s"[WbDataPath] v0 preg write back port num: ${v0WbArbiter.io.out.size}, active port: ${v0WbArbiter.io.inGroup.keys.toSeq.sorted}")
-  println(s"[WbDataPath] vl preg write back port num: ${vlWbArbiter.io.out.size}, active port: ${vlWbArbiter.io.inGroup.keys.toSeq.sorted}")
+  println(s"[WbDataPath] vf preg write back port num: ${vfWbArbiterIO.out.size}, active port: ${vfWbArbiterIO.inGroup.keys.toSeq.sorted}")
+  println(s"[WbDataPath] v0 preg write back port num: ${v0WbArbiterIO.out.size}, active port: ${v0WbArbiterIO.inGroup.keys.toSeq.sorted}")
+  println(s"[WbDataPath] vl preg write back port num: ${vlWbArbiterIO.out.size}, active port: ${vlWbArbiterIO.inGroup.keys.toSeq.sorted}")
 
   // module assign
   intWbArbiter.io.flush <> io.flush
@@ -323,32 +332,32 @@ class WbDataPath(params: BackendParams, schdParams: SchdBlockParams)(implicit p:
   }
   private val fpWbArbiterOut = fpWbArbiter.io.out
 
-  vfWbArbiter.io.flush <> io.flush
-  require(vfWbArbiter.io.in.size == vfArbiterInputsWireY.size, s"vfWbArbiter input size: ${vfWbArbiter.io.in.size}, all vf wb size: ${vfArbiterInputsWireY.size}")
-  vfWbArbiter.io.in.zip(vfArbiterInputsWireY).foreach { case (arbiterIn, in) =>
+  vfWbArbiterIO.flush <> io.flush
+  require(vfWbArbiterIO.in.size == vfArbiterInputsWireY.size, s"vfWbArbiter input size: ${vfWbArbiterIO.in.size}, all vf wb size: ${vfArbiterInputsWireY.size}")
+  vfWbArbiterIO.in.zip(vfArbiterInputsWireY).foreach { case (arbiterIn, in) =>
     arbiterIn.valid := in.valid && in.bits.toVecRf.map(_.valid).getOrElse(false.B)
     in.ready := arbiterIn.ready
     arbiterIn.bits.fromExuOutput(in.bits, "vf")
   }
-  private val vfWbArbiterOut = vfWbArbiter.io.out
+  private val vfWbArbiterOut = vfWbArbiterIO.out
 
-  v0WbArbiter.io.flush <> io.flush
-  require(v0WbArbiter.io.in.size == v0ArbiterInputsWireY.size, s"v0WbArbiter input size: ${v0WbArbiter.io.in.size}, all v0 wb size: ${v0ArbiterInputsWireY.size}")
-  v0WbArbiter.io.in.zip(v0ArbiterInputsWireY).foreach { case (arbiterIn, in) =>
+  v0WbArbiterIO.flush <> io.flush
+  require(v0WbArbiterIO.in.size == v0ArbiterInputsWireY.size, s"v0WbArbiter input size: ${v0WbArbiterIO.in.size}, all v0 wb size: ${v0ArbiterInputsWireY.size}")
+  v0WbArbiterIO.in.zip(v0ArbiterInputsWireY).foreach { case (arbiterIn, in) =>
     arbiterIn.valid := in.valid && in.bits.toV0Rf.map(_.valid).getOrElse(false.B)
     in.ready := arbiterIn.ready
     arbiterIn.bits.fromExuOutput(in.bits, "v0")
   }
-  private val v0WbArbiterOut = v0WbArbiter.io.out
+  private val v0WbArbiterOut = v0WbArbiterIO.out
 
-  vlWbArbiter.io.flush <> io.flush
-  require(vlWbArbiter.io.in.size == vlArbiterInputsWireY.size, s"vlWbArbiter input size: ${vlWbArbiter.io.in.size}, all vl wb size: ${vlArbiterInputsWireY.size}")
-  vlWbArbiter.io.in.zip(vlArbiterInputsWireY).foreach { case (arbiterIn, in) =>
+  vlWbArbiterIO.flush <> io.flush
+  require(vlWbArbiterIO.in.size == vlArbiterInputsWireY.size, s"vlWbArbiter input size: ${vlWbArbiterIO.in.size}, all vl wb size: ${vlArbiterInputsWireY.size}")
+  vlWbArbiterIO.in.zip(vlArbiterInputsWireY).foreach { case (arbiterIn, in) =>
     arbiterIn.valid := in.valid && in.bits.toVlRf.map(_.valid).getOrElse(false.B)
     in.ready := arbiterIn.ready
     arbiterIn.bits.fromExuOutput(in.bits, "vl")
   }
-  private val vlWbArbiterOut = vlWbArbiter.io.out
+  private val vlWbArbiterOut = vlWbArbiterIO.out
 
   // WB -> CtrlBlock
   private val intExuInputs = io.fromIntExu.flatten.toSeq

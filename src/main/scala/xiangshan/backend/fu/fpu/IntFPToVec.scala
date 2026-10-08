@@ -27,6 +27,21 @@ import xiangshan.backend.fu.{FuConfig, FuncUnit, PipedFuncUnit}
 import xiangshan.backend.fu.vector.Bundles.VSew
 import xiangshan.IF2VectorType
 
+class ScalarFli(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg) {
+  private val op = io.in.bits.ctrl.fuOpType
+  private val h = Module(new FliHTable)
+  private val s = Module(new FliSTable)
+  private val d = Module(new FliDTable)
+  h.src := op(4, 0)
+  s.src := op(4, 0)
+  d.src := op(4, 0)
+  io.out.bits.res.data := Mux1H(Seq(
+    (op(7) && op(6) && !op(5)) -> Cat(~0.U(48.W), h.out),
+    (op(7) && !op(6) && !op(5)) -> Cat(~0.U(32.W), s.out, 0.U(16.W)),
+    (op(7) && !op(6) && op(5)) -> Cat(d.out, 0.U(48.W))
+  ))
+}
+
 class IntFPToVec(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg) {
   protected val in = io.in.bits
   protected val out = io.out.bits

@@ -21,7 +21,7 @@ class BypassNetworkIO()(implicit p: Parameters, params: BackendParams) extends X
   // params
   private val intSchdParams = params.schdParams(IntScheduler())
   private val fpSchdParams = params.schdParams(FpScheduler())
-  private val vecSchdParams = params.schdParams(VecScheduler())
+  private val vecSchdParams = params.vecInterfaceParams
 
   val fromDataPath = new FromDataPath
   val toExus = new ToExus
@@ -82,7 +82,7 @@ class BypassNetwork()(implicit p: Parameters, params: BackendParams) extends XSM
   private val fromExus: Seq[ValidIO[ExuBypassBundle]] = (io.fromExus.int ++ io.fromExus.fp ++ io.fromExus.vf).flatten.toSeq
   private val toExusInt: MixedVec[MixedVec[DecoupledIO[ExuInput]]] = Wire(params.intSchdParams.get.genExuInputCopySrcBundle)
   private val toExusFp: MixedVec[MixedVec[DecoupledIO[ExuInput]]] = Wire(params.fpSchdParams.get.genExuInputCopySrcBundle)
-  private val toExusVf: MixedVec[MixedVec[DecoupledIO[ExuInput]]] = Wire(params.vecSchdParams.get.genExuInputCopySrcBundle)
+  private val toExusVf: MixedVec[MixedVec[DecoupledIO[ExuInput]]] = Wire(params.vecInterfaceParams.genExuInputCopySrcBundle)
   private val toExus: Seq[DecoupledIO[ExuInput]] = (toExusInt ++ toExusFp ++ toExusVf).flatten.toSeq
   private val toNewExus: Seq[DecoupledIO[NewExuInput]] = (io.toExus.int ++ io.toExus.fp ++ io.toExus.vf).flatten.toSeq
   private val fromDPsRCData: Seq[Vec[UInt]] = io.fromDataPath.rcData.flatten.toSeq
@@ -120,7 +120,7 @@ class BypassNetwork()(implicit p: Parameters, params: BackendParams) extends XSM
 
   private val intExuNum = params.intSchdParams.get.numExu
   private val fpExuNum  = params.fpSchdParams.get.numExu
-  private val vfExuNum  = params.vecSchdParams.get.numExu
+  private val vfExuNum  = params.vecInterfaceParams.numExu
 
   println(s"[BypassNetwork] allExuNum: ${toExus.size} intExuNum: ${intExuNum} fpExuNum: ${fpExuNum} vfExuNum: ${vfExuNum}")
 

@@ -109,7 +109,7 @@ class LoadUnitS0(param: ExeUnitParams)(
     scalarIssue,
     prefetchLoConf = Wire(DecoupledIO(new LoadStageIO))
 
-  val sources = Seq(
+  val sources = (if (HasVPU) Seq(
     unalignTail,
     replayHiPrio,
     fastReplay,
@@ -118,7 +118,14 @@ class LoadUnitS0(param: ExeUnitParams)(
     vectorIssue,
     scalarIssue,
     prefetchLoConf
-  )
+  ) else Seq(
+    unalignTail,
+    replayHiPrio,
+    fastReplay,
+    replayLoPrio,
+    prefetchHiConf,
+    scalarIssue,
+    prefetchLoConf))
   val sink = Wire(DecoupledIO(new LoadStageIO))
 
   // 0. unalign tail inject from s1
@@ -179,7 +186,7 @@ class LoadUnitS0(param: ExeUnitParams)(
   prefetchHiConf.bits.entrance := LoadEntrance.prefetchHiConf.U
 
   // 5. vector elements splited by VSplit
-  vectorIssue.valid := io.vecldin.valid
+  vectorIssue.valid := HasVPU.B && io.vecldin.valid
   connectSamePort(vectorIssue.bits, io.vecldin.bits)
   vectorIssue.bits.entrance := LoadEntrance.vectorIssue.U
   vectorIssue.bits.accessType.instrType := InstrType.vector.U
@@ -233,6 +240,8 @@ class LoadUnitS0(param: ExeUnitParams)(
   prefetchLoConf.bits.entrance := LoadEntrance.prefetchLoConf.U
   prefetchLoConf.bits.occupySource := VecInit(sources.map(_.valid)).asUInt // for perf
 
+  if (!HasVPU) vectorIssue.ready := true.B
+
   // sources arbitration
   arbiter(sources, sink, Some("RequestSources"))
   val pipeIn = Wire(DecoupledIO(new LoadStageIO))
@@ -257,7 +266,7 @@ class LoadUnitS0(param: ExeUnitParams)(
     * only need to ensure that `req.valid` is HIGH in all cases requiring TLB translation. Meanwhile the strict signal
     * over whether addr translation is actually performed is controled by `noQuery`.
     */
-  val needTlbTransSources = Seq(unalignTail, replayHiPrio, replayLoPrio, vectorIssue, scalarIssue)
+  val needTlbTransSources = (if (HasVPU) Seq(unalignTail, replayHiPrio, replayLoPrio, vectorIssue, scalarIssue) else Seq(unalignTail, replayHiPrio, replayLoPrio, scalarIssue))
   val tlbReqValid = Cat(needTlbTransSources.map(_.valid)).orR && io.dcacheReq.ready
   val tlbFuOpType = ParallelPriorityMux(needTlbTransSources.map(s => (s.valid -> s.bits.uop.fuOpType)))
   val tlbVAddr = ParallelPriorityMux(needTlbTransSources.map(s => (s.valid -> s.bits.vaddr)))
@@ -267,7 +276,7 @@ class LoadUnitS0(param: ExeUnitParams)(
 
   val noQuery = sink.bits.noQuery.get
 
-  val firstIssueSources = Seq(vectorIssue, scalarIssue)
+  val firstIssueSources = (if (HasVPU) Seq(vectorIssue, scalarIssue) else Seq(scalarIssue))
   val firstIssue = Cat(firstIssueSources.map(_.fire)).orR
   val tlbCheckFullva = firstIssue
 
@@ -290,7 +299,7 @@ class LoadUnitS0(param: ExeUnitParams)(
     *   requiring splitting into 2 operations on DCache.
     * - **misalign** is used specifically to denote misalign exception.
     */
-  val needAlignCheckSources = Seq(replayHiPrio, fastReplay, replayLoPrio, vectorIssue, scalarIssue)
+  val needAlignCheckSources = (if (HasVPU) Seq(replayHiPrio, fastReplay, replayLoPrio, vectorIssue, scalarIssue) else Seq(replayHiPrio, fastReplay, replayLoPrio, scalarIssue))
   val needAlignCheckValids = needAlignCheckSources.map(_.valid)
   val alwaysUnalignSources = Seq(unalignTail)
   val alwaysUnalign = Cat(alwaysUnalignSources.map(_.fire)).orR
@@ -486,9 +495,9 @@ class LoadUnitS0(param: ExeUnitParams)(
   XSPerfAccumulate("vecldin_block", io.vecldin.valid && !io.vecldin.ready)
   XSPerfAccumulate("first_issue", firstIssue)
   XSPerfAccumulate("replay_fire", io.replay.fire)
-  XSPerfAccumulate("replay_fire_vector", io.replay.fire && io.replay.bits.accessType.isVector())
+  XSPerfAccumulate("replay_fire_vector", io.replay.fire && (HasVPU.B && io.replay.bits.accessType.isVector()))
   XSPerfAccumulate("fast_replay_fire", io.fastReplay.fire)
-  XSPerfAccumulate("fast_replay_fire_vector", io.fastReplay.fire && io.fastReplay.bits.accessType.isVector())
+  XSPerfAccumulate("fast_replay_fire_vector", io.fastReplay.fire && (HasVPU.B && io.fastReplay.bits.accessType.isVector()))
   XSPerfAccumulate("stall_out", sink.valid && !sink.ready)
   XSPerfAccumulate("stall_dcache", sink.valid && !io.dcacheReq.ready)
   XSPerfAccumulate("vector_addr_vlen_align", io.vecldin.fire && io.vecldin.bits.bankOffset() === 0.U)
@@ -646,7 +655,7 @@ class LoadUnitS1(param: ExeUnitParams)(
   loadTrigger.io.fromCsrTrigger.triggerCanRaiseBpExp := io.csrTrigger.triggerCanRaiseBpExp
   loadTrigger.io.fromCsrTrigger.debugMode := io.csrTrigger.debugMode
   loadTrigger.io.fromLoadStore.vaddr := vaddr
-  loadTrigger.io.fromLoadStore.isVectorUnitStride := accessType.isVector() && VlduType.isUnitStride(fuOpType)
+  loadTrigger.io.fromLoadStore.isVectorUnitStride := (HasVPU.B && accessType.isVector()) && VlduType.isUnitStride(fuOpType)
   loadTrigger.io.fromLoadStore.mask := mask
   loadTrigger.io.isPrf.get := accessType.isPrefetch()
 
@@ -938,11 +947,11 @@ class LoadUnitS2(param: ExeUnitParams)(
   val isNC = tlbHit && tlbAccessable && Pbmt.isNC(pbmt)
   val isMMIO = tlbHit && tlbAccessable && (Pbmt.isIO(pbmt) || Pbmt.isPMA(pbmt) && pmp.mmio)
   val isUncache = isNC || isMMIO
-  val isVector  = accessType.isVector()
+  val isVector  = (HasVPU.B && accessType.isVector())
 
   // load access fault
   val afUnaccessable = uop.exceptionVec(loadAccessFault) || pmpUnaccessable
-  val afVectorUncache = accessType.isVector() && isUncache
+  val afVectorUncache = (HasVPU.B && accessType.isVector()) && isUncache
   val afUnalignMMIO = !in.align.get && isMMIO
   val afTagError = io.dcacheResp.bits.tag_error && tlbHit && io.csrCtrl.cache_error_enable
   val afForwardDenied = Wire(Bool())
@@ -1330,7 +1339,7 @@ class LoadUnitS3(param: ExeUnitParams)(
   val uop = in.uop
   val robIdx = uop.robIdx
   val isScalar = accessType.isScalar()
-  val isVector = accessType.isVector()
+  val isVector = (HasVPU.B && accessType.isVector())
   val isUnalignHead = in.unalignHead.get
   val isUnalignTail = LoadEntrance.isUnalignTail(entrance)
   val troubleMaker = in.troubleMaker.get

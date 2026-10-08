@@ -893,8 +893,8 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       vecLdCanceltmp(i)(j) := allocated(i) && fbk(j).valid && fbk(j).bits.isFlush && uop(i).robIdx === fbk(j).bits.robidx && uop(i).uopIdx === fbk(j).bits.uopidx
       vecLdCommittmp(i)(j) := allocated(i) && fbk(j).valid && fbk(j).bits.isCommit && uop(i).robIdx === fbk(j).bits.robidx && uop(i).uopIdx === fbk(j).bits.uopidx
     }
-    vecLdCancel(i) := vecLdCanceltmp(i).reduce(_ || _)
-    vecLdCommit(i) := vecLdCommittmp(i).reduce(_ || _)
+    vecLdCancel(i) := vecLdCanceltmp(i).foldLeft(false.B)(_ || _)
+    vecLdCommit(i) := vecLdCommittmp(i).foldLeft(false.B)(_ || _)
     XSError(((vecLdCancel(i) || vecLdCommit(i)) && allocated(i)), s"vector load, should not have replay entry $i when commit or flush.\n")
   }
 

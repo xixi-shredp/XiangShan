@@ -838,6 +838,10 @@ object VecDecoder extends DecodeConstants {
     VS8R_V        -> VST(SrcType.X,   VstuType.vsr, whole = T),
   )
 
+  // Scalar FP instructions share their implementation constants with vector FP.
+  // Keep this pure scalar decode subset when no vector backend is instantiated.
+  val scalarTable: Array[(BitPat, List[BitPat])] = opfff.map(x => (x._1, x._2.generate()))
+
   override val decodeArray: Array[(BitPat, XSDecodeBase)] = vset ++
     opivv ++ opivx ++ opivi ++ opmvv ++ opmvx ++ opfvv ++ opfvf ++ opfff ++ vls
 }

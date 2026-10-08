@@ -71,19 +71,22 @@ class StoreUnitS0(param: ExeUnitParams)(
     scalarIssue,
     prefetchReq = Wire(DecoupledIO(new StoreStageIO))
 
-  val sources = Seq(
+  val sources = (if (HasVPU) Seq(
     unalignTail,
     vectorIssue,
     scalarIssue,
     prefetchReq
-  )
+  ) else Seq(
+    unalignTail,
+    scalarIssue,
+    prefetchReq))
   val sink = Wire(DecoupledIO(new StoreStageIO))
 
   // 0. unaligned tail injected from S1
   unalignTail <> io.unalignTail
 
   // 1. vector store elements produced by VSplit
-  vectorIssue.valid := io.vecstin.valid
+  vectorIssue.valid := HasVPU.B && io.vecstin.valid
   connectSamePort(vectorIssue.bits, io.vecstin.bits)
   vectorIssue.bits.DontCareUnalign()
   vectorIssue.bits.DontCareStoreSet()
@@ -130,6 +133,8 @@ class StoreUnitS0(param: ExeUnitParams)(
   prefetchReq.bits.mask := Fill(VLEN/8, 1.U(1.W))
   prefetchReq.bits.isFirstIssue := true.B
 
+  if (!HasVPU) vectorIssue.ready := true.B
+
   // sources arbitration
   arbiter(sources, sink, Some("RequestSources"))
 
@@ -139,7 +144,7 @@ class StoreUnitS0(param: ExeUnitParams)(
   val entrance = sink.bits.entrance
   val accessType = sink.bits.accessType
   val isUnalignTail = StoreEntrance.isUnalignTail(entrance)
-  val isVector = accessType.isVector()
+  val isVector = (HasVPU.B && accessType.isVector())
   val isScalar = accessType.isScalar()
   val isHwPrefetch = accessType.isPrefetch()
   val isCbo = accessType.isCbo
@@ -326,7 +331,7 @@ class StoreUnitS1(param: ExeUnitParams)(
   val ssid = in.ssid.get
   val storeSetHit = in.storeSetHit.get
   val isUnalignTail = StoreEntrance.isUnalignTail(entrance)
-  val isVector = accessType.isVector()
+  val isVector = (HasVPU.B && accessType.isVector())
   val isScalar = accessType.isScalar()
   val isHwPrefetch = accessType.isPrefetch()
   val isCbo = accessType.isCbo
@@ -605,7 +610,7 @@ class StoreUnitS2(param: ExeUnitParams)(
   val robIdx = uop.robIdx
   val align = in.align.get
   val isUnalignTail = StoreEntrance.isUnalignTail(entrance)
-  val isVector = accessType.isVector()
+  val isVector = (HasVPU.B && accessType.isVector())
   val isScalar = accessType.isScalar()
   val isHwPrefetch = accessType.isPrefetch()
   val isCbo = accessType.isCbo
@@ -758,7 +763,7 @@ class StoreUnitS3(param: ExeUnitParams)(
   val entrance = in.entrance
   val accessType = in.accessType
   val isUnalignTail = StoreEntrance.isUnalignTail(entrance)
-  val isVector = accessType.isVector()
+  val isVector = (HasVPU.B && accessType.isVector())
   val isScalar = accessType.isScalar()
   val isHwPrefetch = accessType.isPrefetch()
   val isCbo = accessType.isCbo
@@ -814,7 +819,7 @@ class StoreUnitS3(param: ExeUnitParams)(
   delayPipe.io.redirect := io.redirect
   val sxValid = delayPipe.io.out.valid
   val sxData = delayPipe.io.out.bits
-  val sxVector = sxData.accessType.isVector()
+  val sxVector = (HasVPU.B && sxData.accessType.isVector())
 
   // Pipeline connect
   val pipeOutValid = RegInit(false.B)

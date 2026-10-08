@@ -215,7 +215,9 @@ object EntryBundles extends HasCircularQueuePtrHelper {
                                   else
                                     commonIn.issueResp.finalSuccess)
     common.deqSuccess         := status.issued && finalSuccess && !common.srcLoadCancelVec.asUInt.orR
-    common.srcWakeupByWB      := commonIn.wakeUpFromWB.map{ bundle =>
+    common.srcWakeupByWB      := (if (commonIn.wakeUpFromWB.isEmpty)
+                                    Seq.fill(params.numRegSrc)(false.B)
+                                  else commonIn.wakeUpFromWB.map{ bundle =>
                                     val psrcSrcTypeVec = status.srcStatus.map(_.psrc) zip status.srcStatus.map(_.srcType)
                                     if (params.numRegSrc == 4) {
                                       bundle.bits.wakeUp(psrcSrcTypeVec.take(3), bundle.valid) :+
@@ -223,7 +225,7 @@ object EntryBundles extends HasCircularQueuePtrHelper {
                                     }
                                     else
                                       bundle.bits.wakeUp(psrcSrcTypeVec, bundle.valid)
-                                 }.transpose.map(x => VecInit(x.toSeq).asUInt.orR).toSeq
+                                 }.transpose.map(x => VecInit(x.toSeq).asUInt.orR).toSeq)
     common.canIssue           := validReg && status.canIssue
     common.enqReady           := !validReg || commonIn.transSel
     common.clear              := common.flushed || common.deqSuccess || commonIn.transSel
@@ -326,7 +328,7 @@ object EntryBundles extends HasCircularQueuePtrHelper {
     val allExuParams = p(XSCoreParamsKey).backendParams.allExuParams
     exuSource.toExuOH(params).zip(allExuParams).map{case (oh,e) =>
       if (e.isVfExeUnit) oh else false.B
-    }.reduce(_ || _)
+    }.foldLeft(false.B)(_ || _)
   }
 
   def EntryRegCommonConnect(common: CommonWireBundle, hasIQWakeup: Option[CommonIQWakeupBundle], validReg: Bool, entryUpdate: EntryBundle, entryReg: EntryBundle, status: Status, commonIn: CommonInBundle, isEnq: Boolean, isComp: Boolean)(implicit p: Parameters, params: IssueBlockParams) = {
@@ -615,7 +617,7 @@ object EntryBundles extends HasCircularQueuePtrHelper {
           x.bits.wakeUpV0((status.srcStatus(i).psrc, status.srcStatus(i).srcType), x.valid)
         else
           x.bits.wakeUp(Seq((status.srcStatus(i).psrc, status.srcStatus(i).srcType)), x.valid).head
-      }.reduce(_ || _)
+      }.foldLeft(false.B)(_ || _)
     }
     enqDelayOut.srcVlWakeUpByWB.foreach(
       _ := enqDelayIn.wakeUpFromWB.filter(_.bits.dataConfig.isInstanceOf[VlData]).map {

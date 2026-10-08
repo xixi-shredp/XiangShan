@@ -101,7 +101,9 @@ class ExceptionGen(params: BackendParams)(implicit p: Parameters) extends XSModu
   val varith_wb = wbAllExcept.zip(wbExuParams).filter(_._2.fuConfigs.filter(_.isVecArith).nonEmpty).map(_._1)
   val vls_wb = wbAllExcept.zip(wbExuParams).filter(_._2.fuConfigs.exists(x => FuType.FuTypeOrR(x.fuType, FuType.vecMem))).map(_._1)
 
-  val writebacks = Seq(csr_wb, load_wb, store_wb, varith_wb, vls_wb)
+  // Omit absent vector groups; do not instantiate empty exception comparators.
+  val writebacks = Seq(csr_wb, load_wb, store_wb, varith_wb, vls_wb).filter(_.nonEmpty)
+  require(writebacks.nonEmpty, "ROB requires at least one scalar exception writeback group")
   val in_wb_valids = writebacks.map(_.map(w => w.valid && w.bits.has_exception && !lastCycleFlush))
   val wb_valid = in_wb_valids.zip(writebacks).map { case (valid, wb) =>
     valid.zip(wb.map(_.bits)).map { case (v, bits) => v && !(bits.robIdx.needFlush(io.redirect) || io.flush) }.reduce(_ || _)

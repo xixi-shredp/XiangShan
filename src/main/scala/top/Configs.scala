@@ -453,6 +453,18 @@ class FrontendDebugConfig(n: Int = 1) extends Config(
   })
 )
 
+/** Scalar BackendV2 with coherent L2 and a cacheless CHI home node. */
+class BackendV2NoRVVNoLLCConfig(n: Int = 1) extends Config(
+  new BackendV2Config(n).alter((site, here, up) => {
+    case EnableCachelessCHIHome => true
+    case SoCParamsKey => up(SoCParamsKey).copy(OpenLLCParamsOpt = None)
+    case XSTileKey =>
+      require(n == 1, "BackendV2NoRVVNoLLCConfig supports one coherent requester")
+      up(XSTileKey).map(p => p.copy(HasVPU = false, VecLoadPipelineWidth = 0, VecStorePipelineWidth = 0,
+        L2CacheParamsOpt = p.L2CacheParamsOpt.map(_.copy(supportSeparateWriteCompletion = true))))
+  })
+)
+
 class BackendV2Config(n: Int = 1) extends Config(
   new DefaultConfig(n).alter((site, here, up) => {
     case XSTileKey => up(XSTileKey).map { p =>

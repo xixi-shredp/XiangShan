@@ -121,7 +121,8 @@ class XiangShanSim(implicit p: Parameters) extends Module with HasDiffTestInterf
     l_memXbar.memNode,
     debugOpts.SimMemSize,
     useBlackBox = true,
-    dynamicLatency = debugOpts.UseDRAMSim
+    dynamicLatency = debugOpts.UseDRAMSim,
+    dramContract = Some((3000, 66))
   )
   val simAXIMem = Module(l_simAXIMem.module)
 

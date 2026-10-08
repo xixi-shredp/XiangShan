@@ -17,7 +17,7 @@ case class WbArbiterParams(
 
   def numIn = wbCfgs.length
 
-  def numOut = wbCfgs.head match {
+  def numOut = if (wbCfgs.isEmpty) 0 else wbCfgs.head match {
     case _: WbConfig.IntWB => pregParams.numWrite.getOrElse(backendParams.getWbPortIndices(IntData()).size)
     case _: WbConfig.FpWB => pregParams.numWrite.getOrElse(backendParams.getWbPortIndices(FpData()).size)
     case _: WbConfig.VfWB => pregParams.numWrite.getOrElse(backendParams.getWbPortIndices(VecData()).size)

@@ -71,6 +71,12 @@ case class BackendParams(
   def intSchdParams = schdParams.get(IntScheduler())
   def fpSchdParams = schdParams.get(FpScheduler())
   def vecSchdParams = schdParams.get(VecScheduler())
+  // Empty interface metadata does not instantiate a scheduler or physical register file.
+  lazy val vecInterfaceParams: SchdBlockParams = vecSchdParams.getOrElse {
+    val empty = SchdBlockParams(Seq.empty, 1, 0, VecScheduler(), 128)
+    empty.backendParam = this
+    empty
+  }
   def allSchdParams: Seq[SchdBlockParams] =
     (Seq(intSchdParams) :+ fpSchdParams :+ vecSchdParams)
     .filter(_.nonEmpty)
@@ -86,11 +92,11 @@ case class BackendParams(
 
   def intPregParams: IntPregParams = pregParams.collectFirst { case x: IntPregParams => x }.get
   def fpPregParams: FpPregParams = pregParams.collectFirst { case x: FpPregParams => x }.get
-  def vfPregParams: VfPregParams = pregParams.collectFirst { case x: VfPregParams => x }.get
-  def v0PregParams: V0PregParams = pregParams.collectFirst { case x: V0PregParams => x }.get
-  def vlPregParams: VlPregParams = pregParams.collectFirst { case x: VlPregParams => x }.get
+  def vfPregParams: VfPregParams = pregParams.collectFirst { case x: VfPregParams => x }.getOrElse(VfPregParams(128, 1, Some(0), Some(0)))
+  def v0PregParams: V0PregParams = pregParams.collectFirst { case x: V0PregParams => x }.getOrElse(V0PregParams(22, 1, Some(0), Some(0)))
+  def vlPregParams: VlPregParams = pregParams.collectFirst { case x: VlPregParams => x }.getOrElse(VlPregParams(32, 1, Some(0), Some(0)))
   def getPregParams: Map[DataConfig, PregParams] = {
-    pregParams.map(x => (x.dataCfg, x)).toMap
+    (Seq(vfPregParams, v0PregParams, vlPregParams) ++ pregParams).map(x => (x.dataCfg, x)).toMap
   }
 
   def pregIdxWidth = pregParams.map(_.addrWidth).max
@@ -554,7 +560,7 @@ object BackendV2SchdParams {
   def numPregsVec = 128
   def rfDataWidthVec = 128
 
-  def intSchdParams = {
+  def intSchdParams(hasVPU: Boolean = true) = {
     implicit val schdType: SchedulerType = IntScheduler()
     SchdBlockParams(Seq(
       IssueBlockParams(Seq(
@@ -568,12 +574,12 @@ object BackendV2SchdParams {
       IssueBlockParams(Seq(
         ExeUnitParams(
           "ALU2",
-          Seq(AluCfg, I2fCfg, VSetRiWiCfg, VSetRiWvfCfg, I2vCfg, BkuCfg, MulCfg),
-          Seq(IntWB(port = 2, 0), VfWB(4, 0), V0WB(port = 2, 0), FpWB(port = 0, 1)),
+          Seq(AluCfg, I2fCfg, BkuCfg, MulCfg) ++ (if (hasVPU) Seq(VSetRiWiCfg, VSetRiWvfCfg, I2vCfg) else Seq.empty),
+          Seq(IntWB(port = 2, 0), FpWB(port = 0, 1)) ++ (if (hasVPU) Seq(VfWB(4, 0), V0WB(port = 2, 0)) else Seq.empty),
           Seq(Seq(IntRD(2, 0)), Seq(IntRD(6, 0))),
           true,
           2,
-          vlWB = VlWB(port = intSchdVlWbPort, 0),
+          vlWB = if (hasVPU) VlWB(port = intSchdVlWbPort, 0) else null,
         ),
         ExeUnitParams("BJU2", Seq(BrhCfg, JmpCfg), Seq(), Seq(Seq(IntRD(2, 1)), Seq(IntRD(6, 1))))
       ), numEntries = IssueQueueSize, numEnq = 2, numComp = IssueQueueCompEntrySize),
@@ -609,12 +615,12 @@ object BackendV2SchdParams {
     )
   }
 
-  def fpSchdParams = {
+  def fpSchdParams(hasVPU: Boolean = true) = {
     implicit val schdType: SchedulerType = FpScheduler()
     SchdBlockParams(Seq(
       // FcmpCfg and FcvtCfg must be in the same ExuUnit because they both need to write to the integer register file.
       IssueBlockParams(Seq(
-        ExeUnitParams("FEX0", Seq(FaluCfg, FmacCfg, FcvtCfg, FcmpCfg, F2vCfg), Seq(FpWB(port = 0, 0), IntWB(port = 3, 1), VfWB(port = 5, 0), V0WB(port = 3, 0)), Seq(Seq(FpRD(0, 0)), Seq(FpRD(1, 0)), Seq(FpRD(2, 0)))),
+        ExeUnitParams("FEX0", Seq(FaluCfg, FmacCfg, FcvtCfg, FcmpCfg) ++ (if (hasVPU) Seq(F2vCfg) else Seq(ScalarFliCfg)), Seq(FpWB(port = 0, 0), IntWB(port = 3, 1)) ++ (if (hasVPU) Seq(VfWB(port = 5, 0), V0WB(port = 3, 0)) else Seq.empty), Seq(Seq(FpRD(0, 0)), Seq(FpRD(1, 0)), Seq(FpRD(2, 0)))),
       ), numEntries = 18, numEnq = 2, numComp = 14),
       IssueBlockParams(Seq(
         ExeUnitParams("FEX1", Seq(FaluCfg, FmacCfg, FdivCfg), Seq(FpWB(port = 1, 0)), Seq(Seq(FpRD(3, 0)), Seq(FpRD(4, 0)), Seq(FpRD(5, 0)))),

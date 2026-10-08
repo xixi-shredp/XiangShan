@@ -39,16 +39,37 @@ module HintDpi (
   input logic [31:0] stats_lhrStall,
   input logic [31:0] stats_confUp,
   input logic [31:0] stats_confDown,
-  input logic [31:0] stats_confDropped
+  input logic [31:0] stats_confDropped,
+  input logic [31:0] stats_lookupPortFallback,
+  input logic [31:0] stats_metadataFallback,
+  input logic [31:0] stats_rollbackFallback,
+  input logic [31:0] stats_clearingFallback,
+  input logic [31:0] stats_s3Confirmed,
+  input logic [31:0] stats_recordAllocate,
+  input logic [31:0] stats_lhrWrites,
+  input logic [31:0] stats_confFullWait,
+  input logic [31:0] stats_confApply,
+  input logic [31:0] stats_confUndo,
+  input logic [31:0] stats_confAccepted,
+  input logic [31:0] stats_confCanceled,
+  input logic [31:0] stats_confRetired
 );
-  import "DPI-C" function void h2p_hint_tick(
+  import "DPI-C" context function void h2p_hint_tick(
     input bit reset,
     input int unsigned camMiss, contextMiss, confZero, overrides,
     input int unsigned metaStall, lhrStall, confUp, confDown, confDropped,
     output bit valid, output byte unsigned kind,
     output int unsigned index, output longint unsigned data,
     output bit enabled, output bit profile, output bit measure);
+  import "DPI-C" function void h2p_hint_extended_stats(
+    input int unsigned lookupPortFallback, metadataFallback, rollbackFallback, clearingFallback, s3Confirmed, recordAllocate, lhrWrites, confFullWait, confApply, confUndo, confAccepted, confCanceled, confRetired);
   import "DPI-C" function void h2p_hint_ack(input bit reset, input bit valid, input bit ready);
+  // The emulator calls this between complete cycles. It prevents a one-cycle
+  // lag at the first/last measure edge; it changes no prediction or load state.
+  export "DPI-C" task h2p_hint_phase_set;
+  task h2p_hint_phase_set(input bit active);
+    measure = active;
+  endtask
   byte unsigned dpiKind;
   int unsigned dpiIndex;
   longint unsigned dpiData;
@@ -58,6 +79,7 @@ module HintDpi (
   end
   always @(posedge clock) h2p_hint_ack(reset, loadValid, loadReady);
   always @(negedge clock) begin
+    h2p_hint_extended_stats(stats_lookupPortFallback, stats_metadataFallback, stats_rollbackFallback, stats_clearingFallback, stats_s3Confirmed, stats_recordAllocate, stats_lhrWrites, stats_confFullWait, stats_confApply, stats_confUndo, stats_confAccepted, stats_confCanceled, stats_confRetired);
     h2p_hint_tick(reset, stats_camMiss, stats_contextMiss, stats_confZero,
                   stats_overrides, stats_metaStall, stats_lhrStall,
                   stats_confUp, stats_confDown, stats_confDropped,

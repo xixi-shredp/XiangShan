@@ -90,7 +90,7 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
 
   private val walkPtrSnapshots = SnapshotGenerator(enqPtr, io.snpt.snptEnq, io.snpt.snptDeq, io.redirect.valid, io.snpt.flushVec)
 
-  val vcfgPtrOH = RegInit(1.U(size.W))
+  val vcfgPtrOH = if (HasVPU) RegInit(1.U(size.W)) else 1.U(size.W)
   val vcfgPtrOHShift = CircularShift(vcfgPtrOH)
   // may shift [0, 2) steps
   val vcfgPtrOHSeq = Seq.tabulate(2)(vcfgPtrOHShift.left)
@@ -101,11 +101,11 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
   val renameBuffer = Reg(Vec(size, new RenameBufferEntry))
   val renameBufferEntries = VecInit((0 until size) map (i => renameBuffer(i)))
 
-  val vecLoadExcp = Reg(io.fromRob.vecLoadExcp.cloneType)
+  val vecLoadExcp = if (HasVPU) Reg(io.fromRob.vecLoadExcp.cloneType) else WireDefault(0.U.asTypeOf(io.fromRob.vecLoadExcp))
 
   private val maxLMUL = 8
   private val vdIdxWidth = log2Up(maxLMUL + 1)
-  val currentVdIdx = Reg(UInt(vdIdxWidth.W)) // store 0~8
+  val currentVdIdx = if (HasVPU) Reg(UInt(vdIdxWidth.W)) else 0.U(vdIdxWidth.W) // store 0~8
 
   val s_idle :: s_special_walk :: s_walk :: Nil = Enum(3)
   val state = RegInit(s_idle)
@@ -173,7 +173,7 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
 
   // update vcfg pointer
   // TODO: do not use diffPtrNext here
-  vcfgPtrOH := diffPtrNext.toOH
+  if (HasVPU) vcfgPtrOH := diffPtrNext.toOH
 
   // update enq pointer
   val enqPtrNext = Mux(
@@ -235,8 +235,8 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
       stateNext := s_walk
     }.otherwise {
       stateNext := s_special_walk
-      vecLoadExcp := io.fromRob.vecLoadExcp
-      when(io.fromRob.vecLoadExcp.valid) {
+      if (HasVPU) vecLoadExcp := io.fromRob.vecLoadExcp
+      if (HasVPU) when(io.fromRob.vecLoadExcp.valid) {
         currentVdIdx := 0.U
       }
     }
@@ -248,10 +248,10 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
         stateNext := s_idle
       }
       is(s_special_walk) {
-        currentVdIdx := currentVdIdx + specialWalkCount
+        if (HasVPU) currentVdIdx := currentVdIdx + specialWalkCount
         when(specialWalkEndNext) {
           stateNext := s_walk
-          vecLoadExcp.valid := false.B
+          if (HasVPU) vecLoadExcp.valid := false.B
         }
       }
       is(s_walk) {
@@ -273,6 +273,8 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
   io.status.walkEnd := walkEndNext
   io.status.commitEnd := commitEndNext
 
+  io.toVecExcpMod := 0.U.asTypeOf(io.toVecExcpMod)
+  if (HasVPU) {
   for (i <- 0 until RabCommitWidth) {
     val valid = (state === s_special_walk) && vecLoadExcp.valid && io.commits.commitValid(i)
     io.toVecExcpMod.logicPhyRegMap(i).valid := RegNext(valid)
@@ -281,6 +283,8 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
         x.lreg := RegEnable(io.commits.info(i).ldest, valid)
         x.preg := RegEnable(io.commits.info(i).pdest, valid)
     }
+  }
+
   }
 
   // for difftest

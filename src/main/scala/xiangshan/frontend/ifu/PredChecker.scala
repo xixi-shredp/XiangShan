@@ -115,7 +115,13 @@ class PredChecker(implicit p: Parameters) extends IfuModule {
   private val fixedTakenVec = VecInit(pdInfoVec.zipWithIndex.map { case (pd, i) =>
     pd.brAttribute.isIndirect || pd.brAttribute.isDirect || (isPredTaken(i) && !pd.notCFI)
   })
-  io.resp.stage1Out.fixedTaken := fixedTakenVec
+  // A no-pop indirect without a predicted target resumes at the sequential PC.
+  // Tell backend that this instruction did not follow a valid taken prediction:
+  // another CFI in the same FTQ block may carry equal but unrelated target bits.
+  // Keep fixedTakenVec below for IFU redirect/history recovery unchanged.
+  io.resp.stage1Out.fixedTaken := VecInit((0 until IBufferEnqueueWidth).map { i =>
+    fixedTakenVec(i) && !jalrFaultVec(i)
+  })
 
   private val mispredIdx = WireDefault(0.U.asTypeOf(ValidUndirectioned(UInt(log2Ceil(IBufferEnqueueWidth).W))))
   private val stage1Fault = VecInit.tabulate(IBufferEnqueueWidth)(i =>

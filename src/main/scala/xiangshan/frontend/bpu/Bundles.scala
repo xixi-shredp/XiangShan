@@ -344,6 +344,10 @@ class BpuPerfMeta(implicit p: Parameters) extends BpuBundle {
   val startPc:      Pc                  = new Pc
   val s1Prediction: Prediction          = new Prediction
   val s3Prediction: Prediction          = new Prediction
+  // Simulation observation only. No query, redirect, or predictor uses these.
+  val debug_preHintPrediction: Option[Prediction] = Option.when(!env.FPGAPlatform)(new Prediction)
+  val debug_usedHint: Option[Bool] = Option.when(!env.FPGAPlatform)(Bool())
+  val debug_hintQueryCycle: Option[UInt] = Option.when(!env.FPGAPlatform)(UInt(64.W))
   val mbtbMeta:     MainBtbMeta         = new MainBtbMeta
   val bpSource:     BpuPredictionSource = new BpuPredictionSource
 

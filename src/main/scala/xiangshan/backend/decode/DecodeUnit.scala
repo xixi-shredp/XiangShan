@@ -830,7 +830,7 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
     CBODecode.table ++
     SvinvalDecode.table ++
     HypervisorDecode.table ++
-    VecDecoder.table ++
+    (if (HasVPU) VecDecoder.table else VecDecoder.scalarTable) ++
     ZicondDecode.table ++
     ZimopDecode.table ++
     ZfaDecode.table ++
@@ -870,7 +870,7 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
   decodedInst.lsrc(1) := inst.RS2
   // src(2) of fma is fs3, src(2) of vector inst is old vd
   decodedInst.lsrc(2) := Mux(isFMA, inst.FS3, inst.VD)
-  decodedInst.lsrc(3) := V0_IDX.U
+  if (HasVPU) decodedInst.lsrc(3) := V0_IDX.U
 
   // read dest location
   decodedInst.ldest := inst.RD
@@ -886,8 +886,8 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
   dontTouch(isCsrw)
 
   // for csrr vl instruction, convert to vsetvl
-  val isCsrrVlenb = isCsrr && inst.CSRIDX === CSRs.vlenb.U
-  val isCsrrVl    = isCsrr && inst.CSRIDX === CSRs.vl.U
+  val isCsrrVlenb = HasVPU.B && isCsrr && inst.CSRIDX === CSRs.vlenb.U
+  val isCsrrVl    = HasVPU.B && isCsrr && inst.CSRIDX === CSRs.vl.U
 
   private val isCboClean = CBO_CLEAN === io.enq.decodeInUop.instr
   private val isCboFlush = CBO_FLUSH === io.enq.decodeInUop.instr
@@ -1103,6 +1103,7 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
   decodedInst.needFrm.scalaNeedFrm := scalaNeedFrmInsts.map(_ === inst.ALL).reduce(_ || _)
   decodedInst.needFrm.vectorNeedFrm := vectorNeedFrmInsts.map(_ === inst.ALL).reduce(_ || _)
   decodedInst.vpu := 0.U.asTypeOf(decodedInst.vpu) // Todo: Connect vpu decoder
+  if (HasVPU) {
   decodedInst.vpu.vill  := io.enq.decodeInUop.vtype.illegal
   decodedInst.vpu.vma   := io.enq.decodeInUop.vtype.vma
   decodedInst.vpu.vta   := io.enq.decodeInUop.vtype.vta
@@ -1145,10 +1146,16 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
   decodedInst.srcType(3) := Mux(inst.VM === 0.U, SrcType.vp, SrcType.DC) // mask src
   decodedInst.vlRen := true.B
 
+  } else {
+    decodedInst.vlsInstr := false.B
+    decodedInst.vlRen := false.B
+  }
+
   decodedInst.fpu.fmt := Mux(scalarIsSew32, VSew.e32, Mux(scalarIsSew16, VSew.e16, VSew.e64))
   decodedInst.fpu.wflags := decodedInst.wfflags
   decodedInst.fpu.rm := inst.RM
 
+  if (HasVPU) {
   val uopInfoGen = Module(new UopInfoGen)
   uopInfoGen.io.in.preInfo.isVecArith := inst.isVecArith
   uopInfoGen.io.in.preInfo.isVecMem := inst.isVecStore || inst.isVecLoad
@@ -1166,6 +1173,17 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
   io.deq.uopInfo.numOfWB := uopInfoGen.io.out.uopInfo.numOfWB
   io.deq.uopInfo.lmul := uopInfoGen.io.out.uopInfo.lmul
 
+  } else {
+    io.deq.isComplex := inst.isAMOCAS
+    io.deq.uopInfo.numOfWB := Mux(decodedInst.uopSplitType === UopSplitType.AMO_CAS_Q, 4.U, Mux(inst.isAMOCAS, 2.U, 1.U))
+    io.deq.uopInfo.lmul := 0.U
+    decodedInst.vecWen := false.B
+    decodedInst.v0Wen := false.B
+    decodedInst.vlWen := false.B
+    decodedInst.vlRen := false.B
+    decodedInst.vpu := 0.U.asTypeOf(decodedInst.vpu)
+  }
+
   // decode for SoftPrefetch instructions (prefetch.w / prefetch.r / prefetch.i)
   val isSoftPrefetch = inst.OPCODE === BitPat("b0010011") && inst.FUNCT3 === BitPat("b110") && inst.RD === 0.U
   val isPreW = isSoftPrefetch && inst.RS2 === 3.U(5.W)
@@ -1180,7 +1198,7 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
     decodedInst.srcType(0) := SrcType.no
     decodedInst.srcType(1) := SrcType.no
     decodedInst.srcType(2) := SrcType.no
-    decodedInst.srcType(3) := SrcType.no
+    if (HasVPU) decodedInst.srcType(3) := SrcType.no
     decodedInst.vlRen := true.B
     decodedInst.waitForward   := false.B
     decodedInst.blockBackward := false.B
@@ -1189,7 +1207,7 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
     decodedInst.srcType(0) := SrcType.reg
     decodedInst.srcType(1) := SrcType.imm
     decodedInst.srcType(2) := SrcType.no
-    decodedInst.srcType(3) := SrcType.no
+    if (HasVPU) decodedInst.srcType(3) := SrcType.no
     decodedInst.vlRen := false.B
     decodedInst.selImm := SelImm.IMM_I
     decodedInst.waitForward := false.B

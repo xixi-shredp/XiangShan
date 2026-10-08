@@ -25,7 +25,7 @@ case class RFRdArbParams(
     SeqUtils.mapToMixedVec3(this.inRdCfgs, (rd: RdConfig) => DecoupledIO(new RFArbiterBundle(rd, pregWidth, numBank)))
   }
 
-  def portMax: Int = inRdCfgs.flatten.flatten.map(_.port).max
+  def portMax: Int = inRdCfgs.flatten.flatten.map(_.port).foldLeft(-1)(_ max _)
 }
 
 class RFArbiterBundle(var rdCfg: Option[RdConfig], pregWidth: Int, numBank: Int = 1)(implicit p: Parameters) extends Bundle {

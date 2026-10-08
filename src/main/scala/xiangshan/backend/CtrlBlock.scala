@@ -50,6 +50,15 @@ class CtrlToFtqIO(implicit p: Parameters) extends XSBundle {
 
   val commit = Valid(new FtqPtr)
   val callRetCommit = Vec(CommitWidth, Valid(new CallRetCommit))
+  // Direct ROB retirement observation; absent from FPGA/synthesizable configurations.
+  val debugRetired = Option.when(!env.FPGAPlatform)(Vec(CommitWidth, Valid(new Bundle {
+    val ftqPtr = new FtqPtr
+    val ftqOffset = UInt(FetchBlockInstOffsetWidth.W)
+    val pc = UInt(64.W)
+    val instr = UInt(32.W)
+    val isRVC = Bool()
+    val ordinal = UInt(64.W)
+  })))
 }
 
 class BackendToIBufBundle(implicit p: Parameters) extends XSBundle {
@@ -395,6 +404,40 @@ class CtrlBlockImp(
     ),
     frontendCommit
   )
+
+  io.frontend.toFtq.debugRetired.foreach { lanes =>
+    val rawLocationReported = RegInit(false.B)
+    for (i <- 0 until CommitWidth) {
+      val committedSizes = (0 to i).map(j =>
+        Mux(rob.io.commits.isCommit && rob.io.commits.commitValid(j),
+          rob.io.debugRetiredSizes.get(j), 0.U))
+      lanes(i).valid := rob.io.commits.isCommit && rob.io.commits.commitValid(i)
+      // commitInfo's FTQ fields are the block reclamation watermark (raw ftq - 1, offset 0).
+      // The existing trace path carries the actual rawInfo instruction FTQ location at this edge.
+      val retiredLocation = rob.io.trace.traceCommitInfo.blocks(i).bits
+      lanes(i).bits.ftqPtr := retiredLocation.ftqIdx.get
+      lanes(i).bits.ftqOffset := retiredLocation.ftqOffset.get
+      when(lanes(i).valid) {
+        assert(rob.io.trace.traceCommitInfo.blocks(i).valid,
+          "ROB retirement observation must use same-edge valid raw trace location")
+        assert(retiredLocation.ftqIdx.get === rob.io.commits.info(i).ftqIdx + 1.U,
+          "raw instruction FTQ pointer must be one after block reclamation watermark")
+        assert(rob.io.commits.info(i).ftqOffset === 0.U,
+          "block reclamation commit offset must not be used as instruction offset")
+      }
+      lanes(i).bits.pc := SignExt(rob.io.commits.info(i).debug_pc.get, 64)
+      lanes(i).bits.instr := rob.io.commits.info(i).debug_instr.get
+      lanes(i).bits.isRVC := rob.io.commits.info(i).isRVC
+      lanes(i).bits.ordinal := rob.io.debugRetiredBase.get + committedSizes.reduce(_ +& _)
+      when(lanes(i).valid && BranchAttribute.decode(lanes(i).bits.instr, true.B).needIttage &&
+        !rawLocationReported) {
+        rawLocationReported := true.B
+        printf(p"ROB_RAW_FTQ_LOCATION ordinal=${lanes(i).bits.ordinal} pc=${Hexadecimal(lanes(i).bits.pc)} " +
+          p"raw_ftq=${retiredLocation.ftqIdx.get.asUInt} raw_offset=${retiredLocation.ftqOffset.get} " +
+          p"watermark_ftq=${rob.io.commits.info(i).ftqIdx.asUInt} watermark_offset=${rob.io.commits.info(i).ftqOffset}\n")
+      }
+    }
+  }
 
   val isEmptyDelay = !(RegNext(VecInit(decode.io.in.map(_.valid))).asUInt.orR ||
     RegNext(VecInit(rename.io.in.map(_.valid))).asUInt.orR ||
@@ -912,7 +955,7 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
     val flush = ValidIO(new Redirect)
     val intUopsNum = backendParams.intSchdParams.get.issueBlockParams.filter(_.StdCnt == 0).map(_.numEnq).sum
     val fpUopsNum = backendParams.fpSchdParams.get.issueBlockParams.map(_.numEnq).sum
-    val vfUopsNum = backendParams.vecSchdParams.get.issueBlockParams.map(_.numEnq).sum
+    val vfUopsNum = backendParams.vecInterfaceParams.issueBlockParams.map(_.numEnq).sum
     val intUops = Vec(intUopsNum, DecoupledIO(new DispatchOutUop))
     val fpUops = Vec(fpUopsNum, DecoupledIO(new DispatchOutUop))
     val vfUops = Vec(vfUopsNum, DecoupledIO(new DispatchOutUop))
@@ -926,7 +969,7 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   val toDispatch = new Bundle {
     val wakeUpInt = Flipped(backendParams.intSchdParams.get.genIQWakeUpOutValidBundle)
     val wakeUpFp  = Flipped(backendParams.fpSchdParams.get.genIQWakeUpOutValidBundle)
-    val wakeUpVec = Flipped(backendParams.vecSchdParams.get.genIQWakeUpOutValidBundle)
+    val wakeUpVec = Flipped(backendParams.vecInterfaceParams.genIQWakeUpOutValidBundle)
     val allIssueParams = backendParams.allIssueParams.filter(_.StdCnt == 0)
     val allExuParams = allIssueParams.map(_.exuBlockParams).flatten
     val exuNum = allExuParams.size

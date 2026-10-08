@@ -210,7 +210,7 @@ class VirtualStoreQueue[PhysicalQueuePtrType <: MultiFlagCircularQueuePtr[Physic
         dataEntries(i).robIdx === fbk(j).bits.robidx && dataEntries(i).uopIdx === fbk(j).bits.uopidx
     }
     // vector feedback may occur with deqCancel/needCancel at the same time
-    vecCommit(i) := vecCommittmp(i).reduce(_ || _) && !needCancel(i) && !deqCancel && ctrlEntries(i).allocated
+    vecCommit(i) := vecCommittmp(i).foldLeft(false.B)(_ || _) && !needCancel(i) && !deqCancel && ctrlEntries(i).allocated
 
     when (vecCommit(i)) {
       ctrlEntries(i).vecMbCommit := true.B

@@ -253,9 +253,6 @@ class RenameTableWrapper(implicit p: Parameters) extends XSModule {
 
   val intRat = Module(new RenameTable(Reg_I, RabCommitWidth * MaxUopSize))
   val fpRat  = Module(new RenameTable(Reg_F, RabCommitWidth * MaxUopSize))
-  val vecRat = Module(new RenameTable(Reg_V, RabCommitWidth * MaxUopSize))
-  val v0Rat  = Module(new RenameTable(Reg_V0, RabCommitWidth * MaxUopSize))
-  val vlRat  = Module(new RenameTable(Reg_Vl, CommitWidth))
 
   io.debug_int_rat .foreach(_ := intRat.io.debug_rdata.get)
   if (env.AlwaysBasicDiff || env.EnableDifftest) {
@@ -334,6 +331,10 @@ class RenameTableWrapper(implicit p: Parameters) extends XSModule {
     }
   }
 
+  if (HasVPU) {
+  val vecRat = Module(new RenameTable(Reg_V, RabCommitWidth * MaxUopSize))
+  val v0Rat  = Module(new RenameTable(Reg_V0, RabCommitWidth * MaxUopSize))
+  val vlRat  = Module(new RenameTable(Reg_Vl, CommitWidth))
   if (env.AlwaysBasicDiff || env.EnableDifftest) {
     // Split each 128-bit vector reg into two 64-bit regs (lo, hi), so convert index to (2*index, 2*index+1)
     val splitVecPregs = 2 * (V0PhyRegs + VfPhyRegs)
@@ -452,4 +453,17 @@ class RenameTableWrapper(implicit p: Parameters) extends XSModule {
       diff.data := io.diffVlCommits.get.pdestVl(i)
     }
   }
+  } else {
+    io.vec_old_pdest := 0.U.asTypeOf(io.vec_old_pdest)
+    io.v0_old_pdest := 0.U.asTypeOf(io.v0_old_pdest)
+    io.vl_old_pdest := 0.U.asTypeOf(io.vl_old_pdest)
+    io.vecReadPorts.flatten.foreach(_.data := 0.U)
+    io.v0ReadPorts.foreach(_.data := 0.U)
+    io.vlReadPorts.foreach(_.data := 0.U)
+    io.debug_vec_rat.foreach(_ := 0.U.asTypeOf(io.debug_vec_rat.get))
+    io.debug_v0_rat.foreach(_ := 0.U.asTypeOf(io.debug_v0_rat.get))
+    io.debug_vl_rat.foreach(_ := 0.U.asTypeOf(io.debug_vl_rat.get))
+    io.diff_vl_rat.foreach(_ := 0.U.asTypeOf(io.diff_vl_rat.get))
+  }
+
 }

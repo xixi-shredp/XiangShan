@@ -224,7 +224,7 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
     for (j <- 0 until VecLoadPipelineWidth) {
       vecLdCommittmp(i)(j) := allocated(i) && cmt(j).valid && robIdx(i) === cmt(j).bits.robidx && uopIdx(i) === cmt(j).bits.uopidx
     }
-    vecLdCommit(i) := vecLdCommittmp(i).reduce(_ || _)
+    vecLdCommit(i) := vecLdCommittmp(i).foldLeft(false.B)(_ || _)
 
     when (vecLdCommit(i) && isvec(i)) {
       committed(i) := true.B

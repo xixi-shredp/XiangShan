@@ -154,7 +154,88 @@ trait MemoryHelper { this: Module =>
     response(enable, true)
 }
 
+// Simulation contract only: verify that the C++ instance uses the same clock and
+// callback padding as this elaborated AXI memory. This never enters the SoC.
+class MemoryConfigurationHelper(coreMHz: Int, paddingCycles: Int)
+  extends ExtModule(Map("CORE_MHZ" -> coreMHz, "PADDING_CYCLES" -> paddingCycles))
+  with HasExtModuleInline {
+  val clock = IO(Input(Clock()))
+  val reset = IO(Input(Reset()))
+  val cppExtModule = """
+    |void MemoryConfigurationHelper(int CORE_MHZ, int PADDING_CYCLES, uint8_t reset) {
+    |  if (!reset) memory_model_validate(CORE_MHZ, PADDING_CYCLES);
+    |}
+    |""".stripMargin
+  difftest.DifftestModule.createCppExtModule("MemoryConfigurationHelper", cppExtModule, Some("\"ram.h\""))
+  setInline(s"$desiredName.v", """
+    |import "DPI-C" function void memory_model_validate(input int core_mhz, input int padding_cycles);
+    |module MemoryConfigurationHelper #(parameter CORE_MHZ, PADDING_CYCLES)(input clock, reset);
+    |  always @(posedge clock) if (!reset) memory_model_validate(CORE_MHZ, PADDING_CYCLES);
+    |endmodule
+    |""".stripMargin)
+}
+
+// Actual dynamic-memory write-completion join, separated for directed simulation.
+// IDs remain owned until the master consumes B; W data follows AXI AW order,
+// whereas DRAM callbacks may complete different IDs in any order.
+class AXIWriteCompletion(capacity: Int, idBits: Int = 0) extends Module {
+  require(isPow2(capacity))
+  require(idBits >= 0 && idBits <= 16)
+  val tokenBits = if (idBits == 0) log2Ceil(capacity) else idBits
+  val io = IO(new Bundle {
+    val queryId = Input(UInt(32.W))
+    val canAccept = Output(Bool())
+    val allocSlot = Output(UInt(log2Ceil(capacity).W))
+    val dataId = Input(UInt(32.W))
+    val dataSlot = Output(UInt(log2Ceil(capacity).W))
+    val active = Output(Bool())
+    val accept = Flipped(Valid(UInt(32.W)))
+    val wLast = Flipped(Decoupled(UInt(32.W)))
+    val dram = Flipped(Valid(UInt(32.W)))
+    val b = Decoupled(UInt(32.W))
+    val retire = Flipped(Valid(UInt(32.W)))
+  })
+  val busy = RegInit(VecInit.fill(capacity)(false.B))
+  val ids = Reg(Vec(capacity, UInt(32.W)))
+  val done = RegInit(VecInit.fill(capacity)(false.B))
+  def hits(id: UInt) = VecInit((0 until capacity).map(i => busy(i) && ids(i) === id))
+  def slot(id: UInt) = PriorityEncoder(hits(id))
+  val freeSlot = PriorityEncoder(VecInit(busy.map(v => !v)))
+  io.allocSlot := freeSlot
+  io.dataSlot := slot(io.dataId)
+  val completedW = Module(new Queue(UInt(32.W),capacity,flow=false))
+  io.canAccept := io.queryId < (BigInt(1) << tokenBits).U && !hits(io.queryId).asUInt.orR && !busy.asUInt.andR
+  io.active := busy.asUInt.orR
+  completedW.io.enq <> io.wLast
+  io.b.valid := completedW.io.deq.valid && done(slot(completedW.io.deq.bits))
+  io.b.bits := completedW.io.deq.bits
+  completedW.io.deq.ready := io.b.ready && done(slot(completedW.io.deq.bits))
+  when(io.accept.valid) {
+    assert(io.accept.bits < (BigInt(1) << tokenBits).U && !hits(io.accept.bits).asUInt.orR && !busy.asUInt.andR, "write AXI ID already owned or trackers full")
+    busy(freeSlot) := true.B
+    ids(freeSlot) := io.accept.bits
+    done(freeSlot) := false.B
+  }
+  when(io.wLast.fire) {
+    assert(PopCount(hits(io.wLast.bits)) === 1.U, "W.last has no AW owner")
+  }
+  when(io.dram.valid) {
+    assert(PopCount(hits(io.dram.bits)) === 1.U && !done(slot(io.dram.bits)), "unexpected DRAM write completion")
+    done(slot(io.dram.bits)) := true.B
+  }
+  when(io.b.fire) { done(slot(io.b.bits)) := false.B }
+  when(io.retire.valid) {
+    assert(PopCount(hits(io.retire.bits)) === 1.U, "B has no AW owner")
+    busy(slot(io.retire.bits)) := false.B
+  }
+}
+
 class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(outer) with MemoryHelper {
+  outer.dramContract.foreach { case (coreMHz, paddingCycles) =>
+    val contract = Module(new MemoryConfigurationHelper(coreMHz, paddingCycles))
+    contract.clock := clock
+    contract.reset := reset
+  }
   val ramBaseAddr = outer.address.head.base
   val (ramIndexBits, ramOffsetBits) = (log2Ceil(outer.beatBytes), log2Ceil(outer.memByte))
   def ramIndex(addr: UInt) = ((addr - ramBaseAddr.U)(ramOffsetBits - 1, 0) >> ramIndexBits).asUInt
@@ -171,6 +252,11 @@ class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(out
   // !! This implementation should be only used for simulation purposes. !! 
 
   val numOutstanding = 64
+  // Xbar master offsets are part of the downstream ID. Index by the actual
+  // negotiated bus width using 64 owner slots, never a 2^idBits table.
+  val writeIdBits = in.aw.bits.id.getWidth
+  val readIdBits = in.ar.bits.id.getWidth
+  require(writeIdBits <= 16 && readIdBits <= 16)
   // Note: we are using in.ar.bits.addr.getWidth insead of ramOffsetBits here.
   // Why: the CPU may access out-of-range addresses. Let the RAM helper deal with it.
   val awQueue = Module(new Queue(chiselTypeOf(in.aw.bits), numOutstanding, flow = false))
@@ -180,22 +266,37 @@ class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(out
   val rQueue = Module(new Queue(chiselTypeOf(in.r.bits), numOutstanding * 2, flow = false))
 
   val wTrackers = Module(new Queue(chiselTypeOf(in.aw.bits), numOutstanding, flow = true))
+  val writeCompletion = Module(new AXIWriteCompletion(numOutstanding,writeIdBits))
+  writeCompletion.io.queryId := in.aw.bits.id
+  writeCompletion.io.accept.valid := in.aw.fire
+  writeCompletion.io.accept.bits := in.aw.bits.id
+  writeCompletion.io.retire.valid := in.b.fire
+  writeCompletion.io.retire.bits := in.b.bits.id
+  writeCompletion.io.dataId := wTrackers.io.deq.bits.id
   val wTrackersDataID = RegInit(VecInit.fill(numOutstanding)(0.U(log2Up(outer.burstLen + 1).W)))
 
   val rTrackers = Mem(numOutstanding, chiselTypeOf(in.ar.bits))
   val rTrackersDataID = RegInit(VecInit.fill(numOutstanding)(0.U(log2Up(outer.burstLen + 1).W)))
+  val readBusy = RegInit(VecInit.fill(numOutstanding)(false.B))
+  val readIds = Reg(Vec(numOutstanding,UInt(readIdBits.W)))
+  def readHits(id: UInt) = VecInit((0 until numOutstanding).map(i => readBusy(i) && readIds(i) === id))
+  def readSlot(id: UInt) = PriorityEncoder(readHits(id))
+  val readAllocSlot = PriorityEncoder(VecInit(readBusy.map(v => !v)))
 
   val w_count = RegInit(0.U(log2Up(numOutstanding + 1).W))
   val r_count = RegInit(0.U(log2Up(numOutstanding + 1).W))
 
   // accept a read request and send it to the external model
-  in.ar.ready := arQueue.io.enq.ready
-  arQueue.io.enq.valid := in.ar.valid
+  val readIdAvailable = !readHits(in.ar.bits.id).asUInt.orR && !readBusy.asUInt.andR
+  in.ar.ready := arQueue.io.enq.ready && readIdAvailable
+  arQueue.io.enq.valid := in.ar.valid && readIdAvailable
   arQueue.io.enq.bits := in.ar.bits
 
   when (arQueue.io.enq.fire) {
-    rTrackers.write(in.ar.bits.id, in.ar.bits)
-    rTrackersDataID(in.ar.bits.id) := 0.U
+    rTrackers.write(readAllocSlot, in.ar.bits)
+    rTrackersDataID(readAllocSlot) := 0.U
+    readBusy(readAllocSlot) := true.B
+    readIds(readAllocSlot) := in.ar.bits.id
   }
 
   arQueue.io.deq.ready := readRequest(arQueue.io.deq.valid, arQueue.io.deq.bits.addr, arQueue.io.deq.bits.id)
@@ -212,22 +313,26 @@ class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(out
     read_flap_tracker.id, // second and further read burst if necessary, bypassing external model read
     read_resp_id_ext // first read burst
   )
-  val read_resp_addr = ramIndex(rTrackers(read_resp_id).addr) + rTrackersDataID(read_resp_id)
+  val read_resp_slot = readSlot(read_resp_id)
+  when(read_resp_valid || read_flap) {
+    assert(PopCount(readHits(read_resp_id)) === 1.U, "AXI4Memory: unexpected DRAM read ID")
+  }
+  val read_resp_addr = ramIndex(rTrackers(read_resp_slot).addr) + rTrackersDataID(read_resp_slot)
 
   rPipe.io.enq.valid := read_resp_valid || read_flap
   rPipe.io.enq.bits.id := read_resp_id
   rPipe.io.enq.bits.data := DontCare // read data is not available yet
   rPipe.io.enq.bits.resp := AXI4Parameters.RESP_OKAY
-  rPipe.io.enq.bits.last := rTrackersDataID(read_resp_id) === rTrackers(read_resp_id).len
+  rPipe.io.enq.bits.last := rTrackersDataID(read_resp_slot) === rTrackers(read_resp_slot).len
 
   when (rPipe.io.enq.fire) {
     when (!rPipe.io.enq.bits.last) {
       read_flap := true.B
-      read_flap_tracker := Mux(read_flap, read_flap_tracker, rTrackers(read_resp_id))
+      read_flap_tracker := Mux(read_flap, read_flap_tracker, rTrackers(read_resp_slot))
     }.otherwise {
       read_flap := false.B
     }
-    rTrackersDataID(read_resp_id) := rTrackersDataID(read_resp_id) + 1.U
+    rTrackersDataID(read_resp_slot) := rTrackersDataID(read_resp_slot) + 1.U
   }
 
   rPipe.io.deq.ready := rQueue.io.enq.ready
@@ -240,6 +345,10 @@ class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(out
   rQueue.io.deq.ready := in.r.ready
   in.r.valid := rQueue.io.deq.valid
   in.r.bits := rQueue.io.deq.bits
+  when(in.r.fire && in.r.bits.last) {
+    assert(PopCount(readHits(in.r.bits.id)) === 1.U, "AXI4Memory: R has no AR owner")
+    readBusy(readSlot(in.r.bits.id)) := false.B
+  }
 
   // read request counter
   val r_count_inc = arQueue.io.deq.fire
@@ -249,15 +358,16 @@ class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(out
   }
 
   // accept a write request and send it to the external model
-  in.aw.ready := awQueue.io.enq.ready && wTrackers.io.enq.ready && bQueue.io.enq.ready
-  awQueue.io.enq.valid := in.aw.valid && wTrackers.io.enq.ready && bQueue.io.enq.ready
+  val writeIdAvailable = writeCompletion.io.canAccept
+  in.aw.ready := awQueue.io.enq.ready && wTrackers.io.enq.ready && writeIdAvailable
+  awQueue.io.enq.valid := in.aw.valid && wTrackers.io.enq.ready && writeIdAvailable
   awQueue.io.enq.bits := in.aw.bits
 
-  wTrackers.io.enq.valid := in.aw.valid && bQueue.io.enq.ready
+  wTrackers.io.enq.valid := in.aw.valid && awQueue.io.enq.ready && writeIdAvailable
   wTrackers.io.enq.bits := in.aw.bits
 
   when (wTrackers.io.enq.fire) {
-    wTrackersDataID(in.aw.bits.id) := 0.U
+    wTrackersDataID(writeCompletion.io.allocSlot) := 0.U
   }
   
   awQueue.io.deq.ready := writeRequest(awQueue.io.deq.valid, awQueue.io.deq.bits.addr, awQueue.io.deq.bits.id)
@@ -267,19 +377,20 @@ class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(out
   wQueue.io.enq.valid := in.w.valid
   wQueue.io.enq.bits := in.w.bits
 
-  wQueue.io.deq.ready := w_count =/= 0.U
+  wQueue.io.deq.ready := (w_count =/= 0.U) && wTrackers.io.deq.valid &&
+    (!wQueue.io.deq.bits.last || writeCompletion.io.wLast.ready)
 
-  val write_req_addr = ramIndex(wTrackers.io.deq.bits.addr) + wTrackersDataID(wTrackers.io.deq.bits.id)
+  val write_req_addr = ramIndex(wTrackers.io.deq.bits.addr) + wTrackersDataID(writeCompletion.io.dataSlot)
   when (wQueue.io.deq.fire) {
     ramHelper.write(
       addr = write_req_addr,
       data = wQueue.io.deq.bits.data.asTypeOf(Vec(outer.beatBytes, UInt(8.W))),
       mask = wQueue.io.deq.bits.strb.asBools
     )
-    wTrackersDataID(wTrackers.io.deq.bits.id) := wTrackersDataID(wTrackers.io.deq.bits.id) + 1.U
+    wTrackersDataID(writeCompletion.io.dataSlot) := wTrackersDataID(writeCompletion.io.dataSlot) + 1.U
   }
 
-  assert(!wQueue.io.deq.valid || wTrackers.io.deq.valid, "AXI4Memory: write tracker underflow on W channel")
+  assert(!wQueue.io.deq.fire || wTrackers.io.deq.valid, "AXI4Memory: write tracker underflow on W channel")
 
   // write request counter
   val w_count_inc = awQueue.io.deq.fire
@@ -293,14 +404,18 @@ class AXI4MemoryImp[T <: Data](outer: AXI4Memory) extends AXI4SlaveModuleImp(out
   in.b.valid := bQueue.io.deq.valid
   in.b.bits := bQueue.io.deq.bits
 
-  bQueue.io.enq.valid := wQueue.io.deq.fire && wQueue.io.deq.bits.last
-  bQueue.io.enq.bits.id := wTrackers.io.deq.bits.id
+  val (writeRespValid, writeRespId) = writeResponse(writeCompletion.io.active)
+  writeCompletion.io.dram.valid := writeRespValid
+  writeCompletion.io.dram.bits := writeRespId
+  writeCompletion.io.wLast.valid := wQueue.io.deq.valid && (w_count =/= 0.U) &&
+    wTrackers.io.deq.valid && wQueue.io.deq.bits.last
+  writeCompletion.io.wLast.bits := wTrackers.io.deq.bits.id
+  wTrackers.io.deq.ready := writeCompletion.io.wLast.fire
+  bQueue.io.enq.valid := writeCompletion.io.b.valid
+  bQueue.io.enq.bits.id := writeCompletion.io.b.bits
   bQueue.io.enq.bits.resp := AXI4Parameters.RESP_OKAY
+  writeCompletion.io.b.ready := bQueue.io.enq.ready
 
-  wTrackers.io.deq.ready := bQueue.io.enq.fire
-
-  assert(!bQueue.io.enq.valid || wTrackers.io.deq.valid, "AXI4Memory: write tracker underflow on B channel")
-  assert(!bQueue.io.enq.valid || bQueue.io.enq.ready, "AXI4Memory: B channel overflow")
 }
 
 class AXI4Memory
@@ -311,6 +426,7 @@ class AXI4Memory
   val executable: Boolean = true,
   val beatBytes: Int,
   val burstLen: Int,
+  val dramContract: Option[(Int, Int)] = None,
 )(implicit p: Parameters)
   extends AXI4SlaveModule(address, executable, beatBytes, burstLen)
 {
@@ -320,7 +436,8 @@ class AXI4Memory
 class AXI4MemoryWrapper (
   slave: AXI4SlaveNode,
   memByte: Long,
-  useBlackBox: Boolean = false
+  useBlackBox: Boolean = false,
+  dramContract: Option[(Int, Int)] = None
 )(implicit p: Parameters) extends AXI4MemorySlave(slave, memByte, useBlackBox) {
   val ram = LazyModule(new AXI4Memory(
     slaveParam.address,
@@ -328,7 +445,8 @@ class AXI4MemoryWrapper (
     useBlackBox,
     slaveParam.executable,
     portParam.beatBytes,
-    burstLen
+    burstLen,
+    dramContract
   ))
   ram.node := master
 }
@@ -354,10 +472,11 @@ object AXI4MemorySlave {
     slave: AXI4SlaveNode,
     memByte: Long,
     useBlackBox: Boolean = false,
-    dynamicLatency: Boolean = false
+    dynamicLatency: Boolean = false,
+    dramContract: Option[(Int, Int)] = None
   )(implicit p: Parameters): AXI4MemorySlave = {
     val memory = if (dynamicLatency) {
-      LazyModule(new AXI4MemoryWrapper(slave, memByte, useBlackBox))
+      LazyModule(new AXI4MemoryWrapper(slave, memByte, useBlackBox, dramContract))
     } else {
       LazyModule(new AXI4RAMWrapper(slave, memByte, useBlackBox))
     }

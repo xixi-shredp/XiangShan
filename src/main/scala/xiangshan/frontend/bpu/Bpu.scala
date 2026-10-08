@@ -164,6 +164,11 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   private val s3_prediction = Wire(new Prediction)
 
   private val debug_bpId = RegInit(0.U(XLEN.W))
+  private val hintQueryCycle = Option.when(!env.FPGAPlatform) {
+    val cycle = RegInit(0.U(64.W))
+    cycle := cycle + 1.U
+    cycle
+  }
 
   private val s0_startPc    = DuplicateInit(NumStartPcDuplicate, GuardedPcInit(0.U(GuardedVAddrBits.W)))
   private val s0_startPcReg = RegEnable(s0_startPc, !s0_stall)
@@ -286,7 +291,20 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   }
   s0_fire := s1_ready && sramResetDone
   s1_fire := s1_valid && s2_ready && io.toFtq.prediction.ready &&
-    hint.io.canAccept && !s3_override && !redirect.valid
+    !s3_override && !redirect.valid
+
+  // Count only real S1 requests otherwise able to issue. Candidate-resource
+  // pressure inside Hint is a separate counter and can include idle cycles.
+  XSPerfAccumulate("hint_actual_s1_blocked", s1_valid && s2_ready && io.toFtq.prediction.ready &&
+    !s3_override && !redirect.valid && !hint.io.canAccept)
+  if (!env.FPGAPlatform) {
+    val blockedObserver = Module(new xiangshan.frontend.ftq.HintBlockedDpi)
+    blockedObserver.clock := clock
+    blockedObserver.blocked := !reset.asBool && s1_valid && s2_ready && io.toFtq.prediction.ready &&
+      !s3_override && !redirect.valid && !hint.io.canAccept
+    blockedObserver.lhr := hint.io.debugLhrFull.get
+    blockedObserver.meta := hint.io.debugMetaFull.get
+  }
 
   if (sys.env.get("H2P_HINT_DIAG").contains("1")) {
     val hintGate = s1_valid && s2_ready && io.toFtq.prediction.ready &&
@@ -522,7 +540,7 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   println(s"bpu commit meta width: ${s3_commitMeta.getWidth}")
 
   /* *** bpu to ftq io *** */
-  io.toFtq.prediction.valid := (s1_valid && s2_ready && hint.io.canAccept && !redirect.valid) || s3_override
+  io.toFtq.prediction.valid := (s1_valid && s2_ready && !redirect.valid) || s3_override
   when(s3_override) {
     io.toFtq.prediction.bits.fromStage(s3_startPc.get, s3_prediction)
   }.otherwise {
@@ -540,6 +558,15 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   hint.io.s1Prediction := s1_prediction
   hint.io.s1Ptr := io.fromFtq.bpuPtr
   hint.io.s1Fire := s1_fire
+  // Simulation-only prediction-generation identity. This observes the same
+  // pre-edge cycle convention as Hint.profileCycle and never gates prediction.
+  if (!env.FPGAPlatform) {
+    val allocationObserver = Module(new xiangshan.frontend.bpu.hint.HintAllocationDpi)
+    allocationObserver.io.clock := clock
+    allocationObserver.io.valid := !reset.asBool && s1_fire
+    allocationObserver.io.ftqTag := Cat(io.fromFtq.bpuPtr.flag, io.fromFtq.bpuPtr.value)
+    allocationObserver.io.queryCycle := hintQueryCycle.get
+  }
   hint.io.s2Fire := s2_fire
   hint.io.s3Fire := s3_fire
   hint.io.s3Ptr := s3_ftqPtr
@@ -682,6 +709,15 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   s3_perfMeta.bpId                := debug_bpId
   s3_perfMeta.s1Prediction        := s3_s1Prediction
   s3_perfMeta.s3Prediction        := s3_prediction
+  s3_perfMeta.debug_preHintPrediction.foreach { pred =>
+    pred := s3_prediction
+    pred.target := s3_baselineTarget
+  }
+  s3_perfMeta.debug_usedHint.foreach(_ := s3_useHint)
+  s3_perfMeta.debug_hintQueryCycle.foreach { cycle =>
+    val s2QueryCycle = RegEnable(hintQueryCycle.get, s1_fire)
+    cycle := RegEnable(s2QueryCycle, s2_fire)
+  }
   s3_perfMeta.bpSource.s1Source   := s3_s1PredictionSource
   s3_perfMeta.bpSource.s3Source   := s3_predictionSource
   s3_perfMeta.bpSource.s3Override := s3_override

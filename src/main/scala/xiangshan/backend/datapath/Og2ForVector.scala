@@ -71,7 +71,7 @@ class Og2ForVector(params: BackendParams)(implicit p: Parameters) extends XSModu
 }
 
 class Og2ForVectorIO(params: BackendParams)(implicit p: Parameters) extends XSBundle {
-  private val vecSchdParams = params.schdParams(VecScheduler())
+  private val vecSchdParams = params.vecInterfaceParams
 
   val flush: ValidIO[Redirect]                                    = Flipped(ValidIO(new Redirect))
   val ldCancel                                                    = Vec(backendParams.LduCnt + backendParams.HyuCnt, Flipped(new LoadCancelIO))

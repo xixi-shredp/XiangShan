@@ -50,18 +50,42 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
 
   private val intWbBusyArbiter = Module(new IntRFWBCollideChecker(backendParams))
   private val fpWbBusyArbiter = Module(new FpRFWBCollideChecker(backendParams))
-  private val vfWbBusyArbiter = Module(new VfRFWBCollideChecker(backendParams))
-  private val v0WbBusyArbiter = Module(new V0RFWBCollideChecker(backendParams))
-  private val vlWbBusyArbiter = Module(new VlRFWBCollideChecker(backendParams))
+  private val vfWbBusyArbiterIO = if (HasVPU) Module(new VfRFWBCollideChecker(backendParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new RFWBCollideCheckerIO(RFWBCollideCheckerParams(backendParams.getAllWbCfgs, backendParams.vfPregParams))))
+    ports.in.flatten.foreach(_.ready := true.B)
+    ports
+  }
+  private val v0WbBusyArbiterIO = if (HasVPU) Module(new V0RFWBCollideChecker(backendParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new RFWBCollideCheckerIO(RFWBCollideCheckerParams(backendParams.getAllWbCfgs, backendParams.v0PregParams))))
+    ports.in.flatten.foreach(_.ready := true.B)
+    ports
+  }
+  private val vlWbBusyArbiterIO = if (HasVPU) Module(new VlRFWBCollideChecker(backendParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new RFWBCollideCheckerIO(RFWBCollideCheckerParams(backendParams.getAllWbCfgs, backendParams.vlPregParams))))
+    ports.in.flatten.foreach(_.ready := true.B)
+    ports
+  }
 
   private val intPregNumBank = coreParams.intPreg.numBank
   private val intRfBankRaddrWidth = coreParams.intPreg.bankRaddrWidth
   private val intArbiterAddrWidth = coreParams.intPreg.arbiterAddrWidth
   private val intRFReadArbiter = Module(new IntRFBankReadArbiter(backendParams))
   private val fpRFReadArbiter = Module(new FpRFReadArbiter(backendParams))
-  private val vfRFReadArbiter = Module(new VfRFReadArbiter(backendParams))
-  private val v0RFReadArbiter = Module(new V0RFReadArbiter(backendParams))
-  private val vlRFReadArbiter = Module(new VlRFReadArbiter(backendParams))
+  private val vfRFReadArbiterIO = if (HasVPU) Module(new VfRFReadArbiter(backendParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new RFReadArbiterIO(RFRdArbParams(backendParams.getRdCfgs[VfRD], backendParams.vfPregParams))))
+    ports.in.flatten.flatten.foreach(_.ready := true.B)
+    ports
+  }
+  private val v0RFReadArbiterIO = if (HasVPU) Module(new V0RFReadArbiter(backendParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new RFReadArbiterIO(RFRdArbParams(backendParams.getRdCfgs[V0RD], backendParams.v0PregParams))))
+    ports.in.flatten.flatten.foreach(_.ready := true.B)
+    ports
+  }
+  private val vlRFReadArbiterIO = if (HasVPU) Module(new VlRFReadArbiter(backendParams)).io else {
+    val ports = WireDefault(0.U.asTypeOf(new RFReadArbiterIO(RFRdArbParams(backendParams.getVlRdCfgs, backendParams.vlPregParams))))
+    ports.in.flatten.flatten.foreach(_.ready := true.B)
+    ports
+  }
 
   private val og0FailedVec2: MixedVec[Vec[Bool]] = Wire(MixedVec(fromIQ.map(x => Vec(x.size, Bool())).toSeq))
   private val og1FailedVec2: MixedVec[Vec[Bool]] = Wire(MixedVec(fromIQ.map(x => Vec(x.size, Bool())).toSeq))
@@ -69,15 +93,15 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
   // port -> win
   private val intRdArbWinner: Seq2[MixedVec[Bool]] = intRFReadArbiter.io.in.map(_.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq).toSeq
   private val fpRdArbWinner: Seq2[MixedVec[Bool]] = fpRFReadArbiter.io.in.map(_.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq).toSeq
-  private val vfRdArbWinner: Seq2[MixedVec[Bool]] = vfRFReadArbiter.io.in.map(_.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq).toSeq
-  private val v0RdArbWinner: Seq2[MixedVec[Bool]] = v0RFReadArbiter.io.in.map(_.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq).toSeq
-  private val vlRdArbWinner: Seq2[Option[Bool]] = vlRFReadArbiter.io.in.map(_.map(x => x.headOption.map(_.ready)))
+  private val vfRdArbWinner: Seq2[MixedVec[Bool]] = vfRFReadArbiterIO.in.map(_.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq).toSeq
+  private val v0RdArbWinner: Seq2[MixedVec[Bool]] = v0RFReadArbiterIO.in.map(_.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq).toSeq
+  private val vlRdArbWinner: Seq2[Option[Bool]] = vlRFReadArbiterIO.in.map(_.map(x => x.headOption.map(_.ready)))
 
   private val intWbNotBlock: Seq[MixedVec[Bool]] = intWbBusyArbiter.io.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
   private val fpWbNotBlock: Seq[MixedVec[Bool]] = fpWbBusyArbiter.io.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
-  private val vfWbNotBlock: Seq[MixedVec[Bool]] = vfWbBusyArbiter.io.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
-  private val v0WbNotBlock: Seq[MixedVec[Bool]] = v0WbBusyArbiter.io.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
-  private val vlWbNotBlock: Seq[MixedVec[Bool]] = vlWbBusyArbiter.io.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
+  private val vfWbNotBlock: Seq[MixedVec[Bool]] = vfWbBusyArbiterIO.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
+  private val v0WbNotBlock: Seq[MixedVec[Bool]] = v0WbBusyArbiterIO.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
+  private val vlWbNotBlock: Seq[MixedVec[Bool]] = vlWbBusyArbiterIO.in.map(x => MixedVecInit(x.map(_.ready).toSeq)).toSeq
 
   // rdSrcsNotBlock(i)(j)(k): IQ(i).exu(j).src(k) is not blocked
   private val rdSrcsNotBlock: MixedVec[MixedVec[Vec[Bool]]] = Wire(MixedVec(
@@ -138,7 +162,7 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
     }
   }
 
-  vfRFReadArbiter.io.in.zipWithIndex.foreach { case (arbInSeq2, iqIdx) =>
+  vfRFReadArbiterIO.in.zipWithIndex.foreach { case (arbInSeq2, iqIdx) =>
     arbInSeq2.zipWithIndex.foreach { case (arbInSeq, exuIdx) =>
       val srcIndices: Seq[Int] = VecRegSrcDataSet.flatMap(data => fromIQ(iqIdx)(exuIdx).bits.exuParams.getRfReadSrcIdx(data)).toSeq.sorted
       for (srcIdx <- 0 until fromIQ(iqIdx)(exuIdx).bits.exuParams.numRegSrc) {
@@ -155,7 +179,7 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
     }
   }
 
-  v0RFReadArbiter.io.in.zipWithIndex.foreach { case (arbInSeq2, iqIdx) =>
+  v0RFReadArbiterIO.in.zipWithIndex.foreach { case (arbInSeq2, iqIdx) =>
     arbInSeq2.zipWithIndex.foreach { case (arbInSeq, exuIdx) =>
       val srcIndices: Seq[Int] = V0RegSrcDataSet.flatMap(data => fromIQ(iqIdx)(exuIdx).bits.exuParams.getRfReadSrcIdx(data)).toSeq.sorted
       for (srcIdx <- 0 until fromIQ(iqIdx)(exuIdx).bits.exuParams.numRegSrc) {
@@ -172,7 +196,7 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
     }
   }
 
-  vlRFReadArbiter.io.in.zipWithIndex.foreach { case (arbInSeq2, iqIdx) =>
+  vlRFReadArbiterIO.in.zipWithIndex.foreach { case (arbInSeq2, iqIdx) =>
     arbInSeq2.zipWithIndex.foreach { case (arbInSeq, exuIdx) =>
       arbInSeq.headOption.foreach(_.valid := vlRFRen(iqIdx)(exuIdx).get)
       arbInSeq.headOption.foreach(_.bits.addr := fromIQDeqOg1Payload(iqIdx)(exuIdx).psrcVl.get)
@@ -199,19 +223,19 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
     }
   }
 
-  vfWbBusyArbiter.io.in.zip(vfRFWriteReq).foreach { case (arbInSeq, inRFWriteReqSeq) =>
+  vfWbBusyArbiterIO.in.zip(vfRFWriteReq).foreach { case (arbInSeq, inRFWriteReqSeq) =>
     arbInSeq.zip(inRFWriteReqSeq).foreach { case (arbIn, inRFWriteReq) =>
       arbIn.valid := inRFWriteReq
     }
   }
 
-  v0WbBusyArbiter.io.in.zip(v0RFWriteReq).foreach { case (arbInSeq, inRFWriteReqSeq) =>
+  v0WbBusyArbiterIO.in.zip(v0RFWriteReq).foreach { case (arbInSeq, inRFWriteReqSeq) =>
     arbInSeq.zip(inRFWriteReqSeq).foreach { case (arbIn, inRFWriteReq) =>
       arbIn.valid := inRFWriteReq
     }
   }
 
-  vlWbBusyArbiter.io.in.zip(vlRFWriteReq).foreach { case (arbInSeq, inRFWriteReqSeq) =>
+  vlWbBusyArbiterIO.in.zip(vlRFWriteReq).foreach { case (arbInSeq, inRFWriteReqSeq) =>
     arbInSeq.zip(inRFWriteReqSeq).foreach { case (arbIn, inRFWriteReq) =>
       arbIn.valid := inRFWriteReq
     }
@@ -219,7 +243,7 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
 
   private val intSchdParams = params.schdParams(IntScheduler())
   private val fpSchdParams = params.schdParams(FpScheduler())
-  private val vecSchdParams = params.schdParams(VecScheduler())
+  private val vecSchdParams = params.vecInterfaceParams
 
   private val schdParams = params.allSchdParams
 
@@ -399,8 +423,8 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
     vfRfWdata := io.fromVfWb.get.map(x => RegEnable(x.data, x.wen)).toSeq
     vfRfWen.foreach(_.zip(io.fromVfWb.get.map(x => RegNext(x.wen))).foreach { case (wenSink, wenSource) => wenSink := wenSource })
     for (portIdx <- vfRfRaddr.indices) {
-      if (vfRFReadArbiter.io.out.isDefinedAt(portIdx))
-        vfRfRaddr(portIdx) := vfRFReadArbiter.io.out(portIdx).bits.addr
+      if (vfRFReadArbiterIO.out.isDefinedAt(portIdx))
+        vfRfRaddr(portIdx) := vfRFReadArbiterIO.out(portIdx).bits.addr
       else
         vfRfRaddr(portIdx) := 0.U
     }
@@ -408,8 +432,8 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
     v0RfWdata := io.fromV0Wb.get.map(x => RegEnable(x.data, x.wen)).toSeq
     v0RfWen.foreach(_.zip(io.fromV0Wb.get.map(x => RegNext(x.wen))).foreach { case (wenSink, wenSource) => wenSink := wenSource })
     for (portIdx <- v0RfRaddr.indices) {
-      if (v0RFReadArbiter.io.out.isDefinedAt(portIdx))
-        v0RfRaddr(portIdx) := v0RFReadArbiter.io.out(portIdx).bits.addr
+      if (v0RFReadArbiterIO.out.isDefinedAt(portIdx))
+        v0RfRaddr(portIdx) := v0RFReadArbiterIO.out(portIdx).bits.addr
       else
         v0RfRaddr(portIdx) := 0.U
     }
@@ -417,8 +441,8 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
     vlRfWdata := io.fromVlWb.get.map(x => RegEnable(x.data, x.wen)).toSeq
     vlRfWen := io.fromVlWb.get.map(x => RegNext(x.wen)).toSeq
     for (portIdx <- vlRfRaddr.indices) {
-      if (vlRFReadArbiter.io.out.isDefinedAt(portIdx))
-        vlRfRaddr(portIdx) := vlRFReadArbiter.io.out(portIdx).bits.addr
+      if (vlRFReadArbiterIO.out.isDefinedAt(portIdx))
+        vlRfRaddr(portIdx) := vlRFReadArbiterIO.out(portIdx).bits.addr
       else
         vlRfRaddr(portIdx) := 0.U
     }
@@ -716,7 +740,7 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
 
   XSPerfHistogram(s"IntRegFileRead_hist", PopCount(intRFReadArbiter.io.in.flatten.flatten.map(_.valid)), true.B, 0, 20, 1)
   XSPerfHistogram(s"FpRegFileRead_hist", PopCount(fpRFReadArbiter.io.in.flatten.flatten.map(_.valid)), true.B, 0, 20, 1)
-  XSPerfHistogram(s"VfRegFileRead_hist", PopCount(vfRFReadArbiter.io.in.flatten.flatten.map(_.valid)), true.B, 0, 20, 1)
+  XSPerfHistogram(s"VfRegFileRead_hist", PopCount(vfRFReadArbiterIO.in.flatten.flatten.map(_.valid)), true.B, 0, 20, 1)
   XSPerfHistogram(s"IntRegFileWrite_hist", PopCount(intRFWriteReq.flatten), true.B, 0, 20, 1)
   XSPerfHistogram(s"FpRegFileWrite_hist", PopCount(fpRFWriteReq.flatten), true.B, 0, 20, 1)
   XSPerfHistogram(s"VfRegFileWrite_hist", PopCount(vfRFWriteReq.flatten), true.B, 0, 20, 1)
@@ -725,8 +749,8 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
   XSPerfAccumulate(s"IntRFReadAfterArb", PopCount(intRFReadArbiter.io.out.map(x => x.map(_.valid)).flatten))
   XSPerfAccumulate(s"FpRFReadBeforeArb", PopCount(fpRFReadArbiter.io.in.flatten.flatten.map(_.valid)))
   XSPerfAccumulate(s"FpRFReadAfterArb", PopCount(fpRFReadArbiter.io.out.map(_.valid)))
-  XSPerfAccumulate(s"VfRFReadBeforeArb", PopCount(vfRFReadArbiter.io.in.flatten.flatten.map(_.valid)))
-  XSPerfAccumulate(s"VfRFReadAfterArb", PopCount(vfRFReadArbiter.io.out.map(_.valid)))
+  XSPerfAccumulate(s"VfRFReadBeforeArb", PopCount(vfRFReadArbiterIO.in.flatten.flatten.map(_.valid)))
+  XSPerfAccumulate(s"VfRFReadAfterArb", PopCount(vfRFReadArbiterIO.out.map(_.valid)))
   XSPerfAccumulate(s"IntUopBeforeArb", PopCount(fromIntIQ.flatten.map(_.valid)))
   XSPerfAccumulate(s"IntUopAfterArb", PopCount(fromIntIQ.flatten.map(_.fire)))
   XSPerfAccumulate(s"VfUopBeforeArb", PopCount(fromVfIQ.flatten.map(_.valid)))
@@ -736,8 +760,8 @@ class DataPath(implicit p: Parameters, params: BackendParams, param: SchdBlockPa
   XSPerfHistogram(s"IntRFReadAfterArb_hist", PopCount(intRFReadArbiter.io.out.map(x => x.map(_.valid)).flatten), true.B, 0, 16, 2)
   XSPerfHistogram(s"FpRFReadBeforeArb_hist", PopCount(fpRFReadArbiter.io.in.flatten.flatten.map(_.valid)), true.B, 0, 16, 2)
   XSPerfHistogram(s"FpRFReadAfterArb_hist", PopCount(fpRFReadArbiter.io.out.map(_.valid)), true.B, 0, 16, 2)
-  XSPerfHistogram(s"VfRFReadBeforeArb_hist", PopCount(vfRFReadArbiter.io.in.flatten.flatten.map(_.valid)), true.B, 0, 16, 2)
-  XSPerfHistogram(s"VfRFReadAfterArb_hist", PopCount(vfRFReadArbiter.io.out.map(_.valid)), true.B, 0, 16, 2)
+  XSPerfHistogram(s"VfRFReadBeforeArb_hist", PopCount(vfRFReadArbiterIO.in.flatten.flatten.map(_.valid)), true.B, 0, 16, 2)
+  XSPerfHistogram(s"VfRFReadAfterArb_hist", PopCount(vfRFReadArbiterIO.out.map(_.valid)), true.B, 0, 16, 2)
   XSPerfHistogram(s"IntUopBeforeArb_hist", PopCount(fromIntIQ.flatten.map(_.valid)), true.B, 0, 8, 2)
   XSPerfHistogram(s"IntUopAfterArb_hist", PopCount(fromIntIQ.flatten.map(_.fire)), true.B, 0, 8, 2)
   XSPerfHistogram(s"VfUopBeforeArb_hist", PopCount(fromVfIQ.flatten.map(_.valid)), true.B, 0, 8, 2)
@@ -788,7 +812,7 @@ class DataPathIO()(implicit p: Parameters, params: BackendParams, param: SchdBlo
   // params
   private val intSchdParams = params.schdParams(IntScheduler())
   private val fpSchdParams = params.schdParams(FpScheduler())
-  private val vecSchdParams = params.schdParams(VecScheduler())
+  private val vecSchdParams = params.vecInterfaceParams
   // bundles
   val hartId = Input(UInt(8.W))
 

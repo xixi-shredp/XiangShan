@@ -25,12 +25,8 @@ import utils._
 import utility._
 
 
-abstract class BaseFreeList(
-  size: Int,
-  commitWidth: Int,
-  numLogicRegs:Int = 32,
-)(implicit p: Parameters) extends XSModule with HasCircularQueuePtrHelper {
-  val io = IO(new Bundle {
+class FreeListIO(commitWidth: Int, numLogicRegs: Int)(implicit p: Parameters) extends XSBundle {
+
     val redirect = Input(Bool())
     val walk = Input(Bool())
 
@@ -48,7 +44,14 @@ abstract class BaseFreeList(
     val snpt = Input(new SnapshotPort)
 
     val debug_rat = if(backendParams.debugEn) Some(Vec(numLogicRegs, Input(UInt(PhyRegIdxWidth.W)))) else None
-  })
+}
+
+abstract class BaseFreeList(
+  size: Int,
+  commitWidth: Int,
+  numLogicRegs:Int = 32,
+)(implicit p: Parameters) extends XSModule with HasCircularQueuePtrHelper {
+  val io = IO(new FreeListIO(commitWidth, numLogicRegs))
 
   class FreeListPtr extends CircularQueuePtr[FreeListPtr](size)
 

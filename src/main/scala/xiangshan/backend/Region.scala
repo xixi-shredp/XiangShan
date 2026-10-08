@@ -226,10 +226,11 @@ class Region(val params: SchdBlockParams)(implicit p: Parameters) extends XSModu
 
   if (params.isIntSchd) {
     // exu can write to only one register file port
-    val idxes = backendParams.vecSchdParams.get.exuBlockParams.filter(_.writeIntRf).map(_.wbPortConfigs.filter(_.isInstanceOf[IntWB]).head.port)
+    val idxes = backendParams.vecInterfaceParams.exuBlockParams.filter(_.writeIntRf).map(_.wbPortConfigs.filter(_.isInstanceOf[IntWB]).head.port)
     println(s"[Region] vec write int port = ${idxes}")
-    val wakeupFromWB = MixedVecInit(idxes.map(x => io.fromIntWb(x)))
-    val wakeupFromWBDelayed = RegNext(wakeupFromWB)
+    val wakeupFromWB = Wire(MixedVec(idxes.map(x => chiselTypeOf(io.fromIntWb(x)))))
+    wakeupFromWB.zip(idxes).foreach { case (sink, index) => sink := io.fromIntWb(index) }
+    val wakeupFromWBDelayed = if (idxes.nonEmpty) RegNext(wakeupFromWB) else wakeupFromWB
     issueQueues.map { case iq =>
       val vecExuIndices = params.backendParam.allExuParams.filter(x => x.isVfExeUnit || x.isMemExeUnit && x.needVecWen).map(_.exuIdx)
       println(s"[Region_int] vecExuIndices = ${vecExuIndices}")
@@ -246,10 +247,11 @@ class Region(val params: SchdBlockParams)(implicit p: Parameters) extends XSModu
     }
   }
   else if (params.isFpSchd) {
-    val idxes = backendParams.vecSchdParams.get.exuBlockParams.filter(_.writeFpRf).map(_.wbPortConfigs.filter(_.isInstanceOf[FpWB]).head.port)
+    val idxes = backendParams.vecInterfaceParams.exuBlockParams.filter(_.writeFpRf).map(_.wbPortConfigs.filter(_.isInstanceOf[FpWB]).head.port)
     println(s"[Region] vec write fp port = ${idxes}")
-    val wakeupFromWB = MixedVecInit(idxes.map(x => io.fromFpWb(x)))
-    val wakeupFromWBDelayed = RegNext(wakeupFromWB)
+    val wakeupFromWB = Wire(MixedVec(idxes.map(x => chiselTypeOf(io.fromFpWb(x)))))
+    wakeupFromWB.zip(idxes).foreach { case (sink, index) => sink := io.fromFpWb(index) }
+    val wakeupFromWBDelayed = if (idxes.nonEmpty) RegNext(wakeupFromWB) else wakeupFromWB
     issueQueues.map { case iq =>
       val vecExuIndices = params.backendParam.allExuParams.filter(x => x.isVfExeUnit || x.isMemExeUnit && x.needVecWen).map(_.exuIdx)
       println(s"[Region_fp] vecExuIndices = ${vecExuIndices}")
@@ -418,8 +420,10 @@ class Region(val params: SchdBlockParams)(implicit p: Parameters) extends XSModu
     issueQueues.zipWithIndex.foreach { case (iq, i) =>
       iq.io.wbBusyTableRead := wbFuBusyTable.io.out.intRespRead(i)
     }
-    io.vlWriteBackInfoOut.vlFromIntIsZero := exuBlock.io.vlIsZero.get
-    io.vlWriteBackInfoOut.vlFromIntIsVlmax := exuBlock.io.vlIsVlmax.get
+    if (params.writeVConfig) {
+      io.vlWriteBackInfoOut.vlFromIntIsZero := exuBlock.io.vlIsZero.get
+      io.vlWriteBackInfoOut.vlFromIntIsVlmax := exuBlock.io.vlIsVlmax.get
+    }
     io.cross.I2FWakeupOut.get := exuBlock.io.cross.I2FWakeupOut.get
     io.cross.I2FDataOut.get   := exuBlock.io.cross.I2FDataOut.get
     exuBlock.io.cross.F2IDataIn.get := io.cross.F2IDataIn.get
@@ -439,7 +443,7 @@ class Region(val params: SchdBlockParams)(implicit p: Parameters) extends XSModu
       sink.valid := source.valid
       sink.bits := source.bits
     }
-    io.vtype.get := exuBlock.io.vtype.get
+    io.vtype.foreach(_ := exuBlock.io.vtype.get)
     io.toIntPreg := wbDataPath.io.toIntPreg
     io.fenceio.get <> exuBlock.io.fenceio.get
     io.csrToDecode.get <> exuBlock.io.csrToDecode.get
@@ -636,7 +640,7 @@ class Region(val params: SchdBlockParams)(implicit p: Parameters) extends XSModu
     }
     io.vlWriteBackInfoOut.vlFromVfIsZero := exuBlock.io.vlIsZero.get
     io.vlWriteBackInfoOut.vlFromVfIsVlmax := exuBlock.io.vlIsVlmax.get
-    io.vtype.get := exuBlock.io.vtype.get
+    io.vtype.foreach(_ := exuBlock.io.vtype.get)
     wbDataPath.io.fromVfExu.flatten.zip((exuBlock.io.out ++ io.memWriteback).flatten).map { case (sink, source) =>
       sink.valid := source.valid
       sink.bits := source.bits
@@ -885,7 +889,7 @@ class Region(val params: SchdBlockParams)(implicit p: Parameters) extends XSModu
 class RegionIO(val params: SchdBlockParams)(implicit p: Parameters) extends XSBundle {
   val intSchdParam = backendParams.intSchdParams.get
   val fpSchdParam = backendParams.fpSchdParams.get
-  val vecSchdParam = backendParams.vecSchdParams.get
+  val vecSchdParam = backendParams.vecInterfaceParams
   // uops from dispatch, two level vec, not flatten
   val fromDispatch = MixedVec(params.issueBlockParams.filter(_.StdCnt == 0).map(x => Flipped(Vec(x.numEnq, DecoupledIO(new RegionInUop(x))))))
   val hartId = Input(UInt(8.W))
@@ -986,14 +990,14 @@ class RegionIO(val params: SchdBlockParams)(implicit p: Parameters) extends XSBu
   val fromFpIQDeqOg1Payload: Option[MixedVec[MixedVec[IssueQueueDeqOg1Payload]]] =
     Option.when(!params.isFpSchd)(Input(MixedVec(backendParams.schdParams(FpScheduler()).issueBlockParams.map(_.genIssueDeqOg1PayloadBundle))))
   val fromVecIQDeqOg1Payload: Option[MixedVec[MixedVec[IssueQueueDeqOg1Payload]]] =
-    Option.when(!params.isVecSchd)(Input(MixedVec(backendParams.schdParams(VecScheduler()).issueBlockParams.map(_.genIssueDeqOg1PayloadBundle))))
+    Option.when(!params.isVecSchd)(Input(MixedVec(backendParams.vecInterfaceParams.issueBlockParams.map(_.genIssueDeqOg1PayloadBundle))))
 
   val intIQDeqOg1PayloadOut: Option[MixedVec[MixedVec[IssueQueueDeqOg1Payload]]] =
     Option.when(params.isIntSchd)(Output(MixedVec(backendParams.schdParams(IntScheduler()).issueBlockParams.map(_.genIssueDeqOg1PayloadBundle))))
   val fpIQDeqOg1PayloadOut: Option[MixedVec[MixedVec[IssueQueueDeqOg1Payload]]] =
     Option.when(params.isFpSchd)(Output(MixedVec(backendParams.schdParams(FpScheduler()).issueBlockParams.map(_.genIssueDeqOg1PayloadBundle))))
   val vecIQDeqOg1PayloadOut: Option[MixedVec[MixedVec[IssueQueueDeqOg1Payload]]] =
-    Option.when(params.isVecSchd)(Output(MixedVec(backendParams.schdParams(VecScheduler()).issueBlockParams.map(_.genIssueDeqOg1PayloadBundle))))
+    Option.when(params.isVecSchd)(Output(MixedVec(backendParams.vecInterfaceParams.issueBlockParams.map(_.genIssueDeqOg1PayloadBundle))))
 
   // TopDown
   val uopTopDown = new UopTopDown

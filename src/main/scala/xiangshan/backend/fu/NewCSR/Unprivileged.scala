@@ -59,7 +59,7 @@ trait Unprivileged { self: NewCSR with MachineLevel with SupervisorLevel =>
   }).setAddr(CSRs.fcsr)
 
   // vec
-  val vstart = Module(new CSRModule("Vstart", new CSRBundle {
+  val vstart = Option.when(HasVPU)(Module(new CSRModule("Vstart", new CSRBundle {
     // vstart is not a WARL CSR.
     // Since we need to judge whether flush pipe by vstart being not 0 in DecodeStage, vstart must be initialized to some value at reset.
     val vstart = RW(VlWidth - 2, 0).withReset(0.U).withDescription("Index of the first vector element to execute. The implemented width covers indices 0 through 127.")
@@ -76,9 +76,9 @@ trait Unprivileged { self: NewCSR with MachineLevel with SupervisorLevel =>
       reg := reg
     }
   })
-    .setAddr(CSRs.vstart)
+    .setAddr(CSRs.vstart))
 
-  val vcsr = Module(new CSRModule("Vcsr", new CSRBundle {
+  val vcsr = Option.when(HasVPU)(Module(new CSRModule("Vcsr", new CSRBundle {
     val VXSAT = RW(   0).withDescription("Vector fixed-point saturation accrued flag.")
     val VXRM  = RW(2, 1).withDescription("Vector fixed-point rounding mode.")
   }) with HasRobCommitBundle {
@@ -110,24 +110,24 @@ trait Unprivileged { self: NewCSR with MachineLevel with SupervisorLevel =>
     // read connection
     vxsat := reg.VXSAT.asUInt
     vxrm  := reg.VXRM.asUInt
-  }).setAddr(CSRs.vcsr)
+  }).setAddr(CSRs.vcsr))
 
-  val vl = Module(new CSRModule("Vl", new CSRBundle {
+  val vl = Option.when(HasVPU)(Module(new CSRModule("Vl", new CSRBundle {
     val VL = RO(VlWidth - 1, 0).withReset(0.U).withDescription("Current application vector length.")
   }))
-    .setAddr(CSRs.vl)
+    .setAddr(CSRs.vl))
 
-  val vtype = Module(new CSRModule("Vtype", new CSRVTypeBundle) with HasRobCommitBundle {
+  val vtype = Option.when(HasVPU)(Module(new CSRModule("Vtype", new CSRVTypeBundle) with HasRobCommitBundle {
     when(robCommit.vtype.valid) {
       reg := robCommit.vtype.bits
     }
   })
-    .setAddr(CSRs.vtype)
+    .setAddr(CSRs.vtype))
 
-  val vlenb = Module(new CSRModule("Vlenb", new CSRBundle {
+  val vlenb = Option.when(HasVPU)(Module(new CSRModule("Vlenb", new CSRBundle {
     val VLENB = VlenbField(63, 0).withReset(VlenbField.init).withDescription("Vector register length in bytes.")
   }))
-    .setAddr(CSRs.vlenb)
+    .setAddr(CSRs.vlenb))
 
   val cycle = Module(new CSRModule("cycle", new CSRBundle {
     val cycle = RO(63, 0).withDescription("Counter value.")
@@ -196,45 +196,42 @@ trait Unprivileged { self: NewCSR with MachineLevel with SupervisorLevel =>
     CSRs.fflags -> (fcsr.wAliasFflags -> fcsr.fflagsRdata),
     CSRs.frm    -> (fcsr.wAliasFfm    -> fcsr.frmRdata),
     CSRs.fcsr   -> (fcsr.w            -> fcsr.rdata),
-    CSRs.vstart -> (vstart.w          -> vstart.rdata),
-    CSRs.vxsat  -> (vcsr.wAliasVxsat  -> vcsr.vxsat),
-    CSRs.vxrm   -> (vcsr.wAliasVxrm   -> vcsr.vxrm),
-    CSRs.vcsr   -> (vcsr.w            -> vcsr.rdata),
-    CSRs.vl     -> (vl.w              -> vl.rdata),
-    CSRs.vtype  -> (vtype.w           -> vtype.rdata),
-    CSRs.vlenb  -> (vlenb.w           -> vlenb.rdata),
     CSRs.cycle  -> (cycle.w           -> cycle.rdata),
     CSRs.time   -> (time.w            -> time.rdata),
     CSRs.instret -> (instret.w        -> instret.rdata),
-  ) ++ hpmcounters.map(counter => (counter.addr -> (counter.w -> counter.rdata)))
+  ) ++ (if (HasVPU) SeqMap(
+    CSRs.vstart -> (vstart.get.w          -> vstart.get.rdata),
+    CSRs.vxsat  -> (vcsr.get.wAliasVxsat  -> vcsr.get.vxsat),
+    CSRs.vxrm   -> (vcsr.get.wAliasVxrm   -> vcsr.get.vxrm),
+    CSRs.vcsr   -> (vcsr.get.w            -> vcsr.get.rdata),
+    CSRs.vl     -> (vl.get.w              -> vl.get.rdata),
+    CSRs.vtype  -> (vtype.get.w           -> vtype.get.rdata),
+    CSRs.vlenb  -> (vlenb.get.w           -> vlenb.get.rdata),
+  ) else SeqMap.empty) ++ hpmcounters.map(counter => (counter.addr -> (counter.w -> counter.rdata)))
 
   val unprivilegedCSRMods: Seq[CSRModule[_]] = Seq(
     fcsr,
-    vcsr,
-    vstart,
-    vl,
-    vtype,
-    vlenb,
     cycle,
     time,
     instret,
-  ) ++ hpmcounters
+  ) ++ vcsr.toSeq ++ vstart.toSeq ++ vl.toSeq ++ vtype.toSeq ++ vlenb.toSeq ++ hpmcounters
 
   val unprivilegedCSROutMap: SeqMap[Int, UInt] = SeqMap(
     CSRs.fflags  -> fcsr.fflags.asUInt,
     CSRs.frm     -> fcsr.frm.asUInt,
     CSRs.fcsr    -> fcsr.rdata.asUInt,
-    CSRs.vstart  -> vstart.rdata.asUInt,
-    CSRs.vxsat   -> vcsr.vxsat.asUInt,
-    CSRs.vxrm    -> vcsr.vxrm.asUInt,
-    CSRs.vcsr    -> vcsr.rdata.asUInt,
-    CSRs.vl      -> vl.rdata.asUInt,
-    CSRs.vtype   -> vtype.rdata.asUInt,
-    CSRs.vlenb   -> vlenb.rdata.asUInt,
     CSRs.cycle   -> cycle.rdata,
     CSRs.time    -> time.rdata,
     CSRs.instret -> instret.rdata,
-  ) ++ hpmcounters.map(counter => (counter.addr -> counter.rdata))
+  ) ++ (if (HasVPU) SeqMap(
+    CSRs.vstart  -> vstart.get.rdata.asUInt,
+    CSRs.vxsat   -> vcsr.get.vxsat.asUInt,
+    CSRs.vxrm    -> vcsr.get.vxrm.asUInt,
+    CSRs.vcsr    -> vcsr.get.rdata.asUInt,
+    CSRs.vl      -> vl.get.rdata.asUInt,
+    CSRs.vtype   -> vtype.get.rdata.asUInt,
+    CSRs.vlenb   -> vlenb.get.rdata.asUInt,
+  ) else SeqMap.empty) ++ hpmcounters.map(counter => (counter.addr -> counter.rdata))
 }
 
 class CSRVTypeBundle extends CSRBundle {

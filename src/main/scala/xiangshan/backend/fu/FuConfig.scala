@@ -6,7 +6,7 @@ import xiangshan.ExceptionNO._
 import xiangshan.backend.Bundles.{ExuInput, NewExuInput}
 import xiangshan.backend.datapath.DataConfig._
 import xiangshan.backend.decode._
-import xiangshan.backend.fu.fpu.IntFPToVec
+import xiangshan.backend.fu.fpu.{IntFPToVec, ScalarFli}
 import xiangshan.backend.fu.wrapper._
 import xiangshan.mem.Std
 
@@ -307,6 +307,14 @@ object FuConfig {
     latency = CertainLatency(0, extraValue = 3),
     destDataBits = 128,
     srcDataBits = Some(64),
+  )
+
+  val ScalarFliCfg: FuConfig = F2vCfg.copy(
+    name = "scalarFli",
+    fuGen = (p: Parameters, cfg: FuConfig) => Module(new ScalarFli(cfg)(p).suggestName("scalarFli")),
+    writeVecRf = false,
+    writeV0Rf = false,
+    destDataBits = 64,
   )
 
   val CsrCfg: FuConfig = FuConfig (

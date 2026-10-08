@@ -313,7 +313,7 @@ case class XSCoreParameters
     "zicbom", "zicbop", "zicboz", "ziccamoa", "ziccif", "zicclsm", "ziccrse", "zicntr", "zicond",
     "zicsr", "zifencei", "zihintntl", "zihintpause", "zihpm", "zimop", "zkn", "zknd", "zkne", "zknh",
     "zksed", "zksh", "zkt", "zvbb", "zvfh", "zvfhmin", "zvkt", "zvl128b", "zvl32b", "zvl64b"
-  )
+  ).filter(extension => HasVPU || !(extension == "v" || extension.startsWith("zv")))
 
   def vlWidth = log2Up(VLEN) + 1
 
@@ -498,19 +498,15 @@ case class XSCoreParameters
   def fakeIntPreg = FakeIntPregParams(intPreg.numEntries, intPreg.numBank, intPreg.numRead, intPreg.numWrite)
 
   val backendParams: BackendParams = backend.BackendParams(
-    Map(
-      IntScheduler() -> (if (EnableBackendV2Config) backend.BackendV2SchdParams.intSchdParams else intSchdParams),
-      FpScheduler()  -> (if (EnableBackendV2Config) backend.BackendV2SchdParams.fpSchdParams else fpSchdParams),
-      VecScheduler() -> (if (EnableBackendV2Config) backend.BackendV2SchdParams.vecSchdParams else vecSchdParams),
-    ),
+    Map[SchedulerType, SchdBlockParams](
+      IntScheduler() -> (if (EnableBackendV2Config) backend.BackendV2SchdParams.intSchdParams(HasVPU) else intSchdParams),
+      FpScheduler()  -> (if (EnableBackendV2Config) backend.BackendV2SchdParams.fpSchdParams(HasVPU) else fpSchdParams),
+    ) ++ Option.when(HasVPU)(VecScheduler() -> (if (EnableBackendV2Config) backend.BackendV2SchdParams.vecSchdParams else vecSchdParams)),
     Seq(
       intPreg,
       fpPreg,
-      vfPreg,
-      v0Preg,
-      vlPreg,
       fakeIntPreg
-    ),
+    ) ++ (if (HasVPU) Seq(vfPreg, v0Preg, vlPreg) else Seq.empty),
     (if (EnableBackendV2Config) backend.BackendV2SchdParams.iqWakeUpParams else iqWakeUpParams),
   )
 

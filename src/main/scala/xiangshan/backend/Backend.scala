@@ -186,15 +186,15 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   private val ctrlBlock = wrapper.ctrlBlock.module
   private val intRegion = Module(new Region(params.intSchdParams.get))
   private val fpRegion = Module(new Region(params.fpSchdParams.get))
-  private val vecRegion = Module(new Region(params.vecSchdParams.get))
-  private val vecExcpMod = Module(new VecExcpDataMergeModule)
+  private val vecRegion = Option.when(HasVPU)(Module(new Region(params.vecInterfaceParams)))
+  private val vecExcpMod = Option.when(HasVPU)(Module(new VecExcpDataMergeModule))
   private val topDownMod = Module(new TopDownGen)
 
 
   private val vlFromIntIsZero = intRegion.io.vlWriteBackInfoOut.vlFromIntIsZero
   private val vlFromIntIsVlmax = intRegion.io.vlWriteBackInfoOut.vlFromIntIsVlmax
-  private val vlFromVfIsZero = vecRegion.io.vlWriteBackInfoOut.vlFromVfIsZero
-  private val vlFromVfIsVlmax = vecRegion.io.vlWriteBackInfoOut.vlFromVfIsVlmax
+  private val vlFromVfIsZero = vecRegion.map(_.io.vlWriteBackInfoOut.vlFromVfIsZero).getOrElse(false.B)
+  private val vlFromVfIsVlmax = vecRegion.map(_.io.vlWriteBackInfoOut.vlFromVfIsVlmax).getOrElse(false.B)
 
   private val backendCriticalError = Wire(Bool())
 
@@ -206,10 +206,10 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   ctrlBlock.io.fromCSR.instrAddrTransType := RegNext(intRegion.io.csrio.get.instrAddrTransType)
   val wbDataPathToCtrlBlock = intRegion.io.wbDataPathToCtrlBlock.writeback ++
     fpRegion.io.wbDataPathToCtrlBlock.writeback ++
-    vecRegion.io.wbDataPathToCtrlBlock.writeback
+    vecRegion.toSeq.flatMap(_.io.wbDataPathToCtrlBlock.writeback)
   println(s"[Backend] intRegion.io.wbDataPathToCtrlBlock.writeback.size = ${intRegion.io.wbDataPathToCtrlBlock.writeback.size}")
   println(s"[Backend] fpRegion.io.wbDataPathToCtrlBlock.writeback.size = ${fpRegion.io.wbDataPathToCtrlBlock.writeback.size}")
-  println(s"[Backend] vecRegion.io.wbDataPathToCtrlBlock.writeback.size = ${vecRegion.io.wbDataPathToCtrlBlock.writeback.size}")
+  println(s"[Backend] vecRegion.io.wbDataPathToCtrlBlock.writeback.size = ${vecRegion.toSeq.flatMap(_.io.wbDataPathToCtrlBlock.writeback).size}")
   println(s"[Backend] ctrlBlock.io.fromWB.wbData.size = ${ctrlBlock.io.fromWB.wbData.size}, wbDataPathToCtrlBlock.size = ${wbDataPathToCtrlBlock.size}")
   assert(ctrlBlock.io.fromWB.wbData.size == wbDataPathToCtrlBlock.size, "ctrlBlock.io.fromWB.wbData.size == wbDataPathToCtrlBlock.size")
   ctrlBlock.io.fromWB.wbData.zip(wbDataPathToCtrlBlock).map(x => x._1 := x._2)
@@ -227,12 +227,12 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   ctrlBlock.io.fromMemToLsqEnqCtrl  <> io.mem.toLsqEnqCtrl
   ctrlBlock.io.toDispatch.wakeUpInt := intRegion.io.wakeUpToDispatch
   ctrlBlock.io.toDispatch.wakeUpFp  := fpRegion.io.wakeUpToDispatch
-  ctrlBlock.io.toDispatch.wakeUpVec := vecRegion.io.wakeUpToDispatch
-  ctrlBlock.io.toDispatch.IQValidNumVec := intRegion.io.IQValidNumVec ++ fpRegion.io.IQValidNumVec ++ vecRegion.io.IQValidNumVec
+  vecRegion.foreach(v => ctrlBlock.io.toDispatch.wakeUpVec := v.io.wakeUpToDispatch)
+  ctrlBlock.io.toDispatch.IQValidNumVec := intRegion.io.IQValidNumVec ++ fpRegion.io.IQValidNumVec ++ vecRegion.toSeq.flatMap(_.io.IQValidNumVec)
   ctrlBlock.io.toDispatch.debugIQValidNumVec.foreach(_ := intRegion.io.debugIQValidNumVec.get ++
-    fpRegion.io.debugIQValidNumVec.get ++ vecRegion.io.debugIQValidNumVec.get)
+    fpRegion.io.debugIQValidNumVec.get ++ vecRegion.toSeq.flatMap(_.io.debugIQValidNumVec.get))
   ctrlBlock.io.toDispatch.debugIQEnqHasIssuedVec.foreach(_ := intRegion.io.debugIQEnqHasIssuedVec.get ++
-    fpRegion.io.debugIQEnqHasIssuedVec.get ++ vecRegion.io.debugIQEnqHasIssuedVec.get)
+    fpRegion.io.debugIQEnqHasIssuedVec.get ++ vecRegion.toSeq.flatMap(_.io.debugIQEnqHasIssuedVec.get))
   ctrlBlock.io.toDispatch.ldCancel := io.mem.ldCancel
   // Todo: when add cross domain wake up, it is necessary to add assertions that fp and vec do not have 0 lat fu.
   ctrlBlock.io.toDispatch.og0Cancel := intRegion.io.og0Cancel
@@ -244,6 +244,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     x._1.valid := x._2.wen && x._2.fpWen
     x._1.bits := x._2.pdest
   })
+  vecRegion.foreach { vecRegion =>
   ctrlBlock.io.toDispatch.wbPregsVec.zip(vecRegion.io.toVfPreg).map(x => {
     x._1.valid := x._2.wen && x._2.vecWen
     x._1.bits := x._2.pdest
@@ -256,6 +257,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     x._1.valid := x._2.wen && x._2.vlWen
     x._1.bits := x._2.pdest
   })
+  }
   ctrlBlock.io.toDispatch.vlWriteBackInfo.vlFromIntIsZero := vlFromIntIsZero
   ctrlBlock.io.toDispatch.vlWriteBackInfo.vlFromIntIsVlmax := vlFromIntIsVlmax
   ctrlBlock.io.toDispatch.vlWriteBackInfo.vlFromVfIsZero := vlFromVfIsZero
@@ -274,7 +276,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   ctrlBlock.io.debugEnqLsq.req := ctrlBlock.io.toMem.lsqEnqIO.req
   ctrlBlock.io.debugEnqLsq.needAlloc := ctrlBlock.io.toMem.lsqEnqIO.needAlloc
   ctrlBlock.io.debugEnqLsq.iqAccept := ctrlBlock.io.toMem.lsqEnqIO.iqAccept
-  ctrlBlock.io.fromVecExcpMod.busy := vecExcpMod.o.status.busy
+  ctrlBlock.io.fromVecExcpMod.busy := vecExcpMod.map(_.o.status.busy).getOrElse(false.B)
 
   intRegion.io.hartId := io.fromTop.hartId
   intRegion.io.flush := ctrlBlock.io.toIssueBlock.flush
@@ -316,10 +318,10 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   intRegion.io.wakeupToLRQCancel.foreach(x => io.mem.wakeupToLRQCancel.zip(x.flatten).foreach { case (sink, source) => sink := source })
   intRegion.io.staFeedback.  foreach(x => x := io.mem.staIqFeedback)
   intRegion.io.stdFeedback.  foreach(x => x := io.mem.stdIqFeedback)
-  vecRegion.io.vstuFeedback. foreach(x => x := io.mem.vstuIqFeedback)
+  vecRegion.foreach(_.io.vstuFeedback.foreach(x => x := io.mem.vstuIqFeedback))
   intRegion.io.ldCancel := io.mem.ldCancel
   intRegion.io.vlWriteBackInfoIn := 0.U.asTypeOf(intRegion.io.vlWriteBackInfoIn)
-  val regions = Seq(intRegion, fpRegion, vecRegion)
+  val regions = Seq(intRegion, fpRegion) ++ vecRegion.toSeq
   regions.map{ case x =>
     x.io.fromIntWb := 0.U.asTypeOf(x.io.fromIntWb)
     x.io.fromFpWb := 0.U.asTypeOf(x.io.fromFpWb)
@@ -328,9 +330,11 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     x.io.fromVlWb := 0.U.asTypeOf(x.io.fromVlWb)
   }
   intRegion.io.fromIntWb := intRegion.io.toIntPreg
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.fromVfWb := vecRegion.io.toVfPreg
   vecRegion.io.fromV0Wb := vecRegion.io.toV0Preg
   vecRegion.io.fromVlWb := vecRegion.io.toVlPreg
+  }
 
   fpRegion.io.hartId := io.fromTop.hartId
   fpRegion.io.flush := ctrlBlock.io.toIssueBlock.flush
@@ -347,6 +351,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   fpRegion.io.ldCancel := io.mem.ldCancel
   fpRegion.io.vlWriteBackInfoIn := 0.U.asTypeOf(intRegion.io.vlWriteBackInfoIn)
 
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.hartId := io.fromTop.hartId
   vecRegion.io.flush := ctrlBlock.io.toIssueBlock.flush
   vecRegion.io.fromDispatch.flatten.zip(ctrlBlock.io.toIssueBlock.vfUops).foreach { case (sink, source) =>
@@ -369,46 +374,68 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   vecRegion.io.vlWriteBackInfoIn.vlFromVfIsVlmax := vlFromVfIsVlmax
   vecRegion.io.lqDeqPtr.get := io.mem.lqDeqPtr
   vecRegion.io.sqDeqPtr.get := io.mem.sqDeqPtr
+  }
   // for wbDatapath wirte regfile
   intRegion.io.fromFpExu.get := fpRegion.io.exuOut
-  intRegion.io.fromVecExu.get := vecRegion.io.exuOut
+  intRegion.io.fromVecExu.foreach(x => x := 0.U.asTypeOf(x))
+  vecRegion.foreach(v => intRegion.io.fromVecExu.foreach(_ := v.io.exuOut))
   fpRegion.io.fromIntExu.get := intRegion.io.exuOut
-  fpRegion.io.fromVecExu.get := vecRegion.io.exuOut
+  fpRegion.io.fromVecExu.foreach(x => x := 0.U.asTypeOf(x))
+  vecRegion.foreach(v => fpRegion.io.fromVecExu.foreach(_ := v.io.exuOut))
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.fromIntExu.get := intRegion.io.exuOut
+  }
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.fromFpExu.get := fpRegion.io.exuOut
+  }
   // for fast wakeup data
   intRegion.io.fromFpExuBlockOut.get <> fpRegion.io.fpExuBlockOut.get
   intRegion.io.intSchdBusyTable := intRegion.io.wbFuBusyTableWriteOut
   intRegion.io.fpSchdBusyTable := fpRegion.io.wbFuBusyTableWriteOut
-  intRegion.io.vfSchdBusyTable := vecRegion.io.wbFuBusyTableWriteOut
+  intRegion.io.vfSchdBusyTable := 0.U.asTypeOf(intRegion.io.vfSchdBusyTable)
+  vecRegion.foreach(v => intRegion.io.vfSchdBusyTable := v.io.wbFuBusyTableWriteOut)
   fpRegion.io.intSchdBusyTable := intRegion.io.wbFuBusyTableWriteOut
   fpRegion.io.fpSchdBusyTable := fpRegion.io.wbFuBusyTableWriteOut
-  fpRegion.io.vfSchdBusyTable := vecRegion.io.wbFuBusyTableWriteOut
+  fpRegion.io.vfSchdBusyTable := 0.U.asTypeOf(fpRegion.io.vfSchdBusyTable)
+  vecRegion.foreach(v => fpRegion.io.vfSchdBusyTable := v.io.wbFuBusyTableWriteOut)
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.intSchdBusyTable := intRegion.io.wbFuBusyTableWriteOut
+  }
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.fpSchdBusyTable := fpRegion.io.wbFuBusyTableWriteOut
+  }
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.vfSchdBusyTable := vecRegion.io.wbFuBusyTableWriteOut
+  }
   // for intIQ read fp regfile
   fpRegion.io.fromIntIQ.get <> intRegion.io.intIQOut.get
   intRegion.io.fpRfRdataIn.get := fpRegion.io.fpRfRdataOut.get
   // for fpIQ write int regfile arbiter
   intRegion.io.fromFpIQ.get <> fpRegion.io.fpIQOut.get
   // for vecIQ read int/fp regfile
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.fromIntIQ.get <> intRegion.io.intIQOut.get
+  }
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.fromFpIQ.get <> fpRegion.io.fpIQOut.get
-
-  // deqOg1
-  Seq(intRegion, fpRegion, vecRegion).map{region =>
-    region.io.fromIntIQDeqOg1Payload.foreach(_ := intRegion.io.intIQDeqOg1PayloadOut.get)
-    region.io.fromFpIQDeqOg1Payload.foreach(_ := fpRegion.io.fpIQDeqOg1PayloadOut.get)
-    region.io.fromVecIQDeqOg1Payload.foreach(_ := vecRegion.io.vecIQDeqOg1PayloadOut.get)
   }
 
+  // deqOg1
+  regions.map{region =>
+    region.io.fromIntIQDeqOg1Payload.foreach(_ := intRegion.io.intIQDeqOg1PayloadOut.get)
+    region.io.fromFpIQDeqOg1Payload.foreach(_ := fpRegion.io.fpIQDeqOg1PayloadOut.get)
+    region.io.fromVecIQDeqOg1Payload.foreach(x => x := 0.U.asTypeOf(x))
+    vecRegion.foreach(v => region.io.fromVecIQDeqOg1Payload.foreach(_ := v.io.vecIQDeqOg1PayloadOut.get))
+  }
+
+  vecRegion.zip(vecExcpMod).foreach { case (vecRegion, vecExcpMod) =>
   vecRegion.io.diffVlRat.foreach(_ := ctrlBlock.io.diff_vl_rat.get)
   vecRegion.io.fromVecExcpMod.get.r := vecExcpMod.o.toVPRF.r
   vecRegion.io.fromVecExcpMod.get.w := vecExcpMod.o.toVPRF.w
+  }
 
   ctrlBlock.io.toDataPath.pcToDataPathIO <> intRegion.io.fromPcTargetMem.get
-  val toMem = intRegion.io.toMemExu.get ++ vecRegion.io.toMemExu.get
+  val toMem = intRegion.io.toMemExu.get ++ vecRegion.toSeq.flatMap(_.io.toMemExu.get)
   val issue = io.mem.intIssue ++ io.mem.vecIssue
 
   private val csrin = intRegion.io.csrin.get
@@ -423,7 +450,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   csrin.clintTime.bits := RegEnable(io.fromTop.clintTime.bits, io.fromTop.clintTime.valid)
   csrin.l2FlushDone := RegNext(io.fromTop.l2FlushDone)
   csrin.trapInstInfo := ctrlBlock.io.toCSR.trapInstInfo
-  csrin.fromVecExcpMod.busy := vecExcpMod.o.status.busy
+  csrin.fromVecExcpMod.busy := vecExcpMod.map(_.o.status.busy).getOrElse(false.B)
   csrin.criticalErrorState := backendCriticalError
 
   private val csrio = intRegion.io.csrio.get
@@ -433,6 +460,9 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   csrio.fpu.dirty_fs := ctrlBlock.io.robio.csr.dirty_fs
   csrio.vpu <> WireDefault(0.U.asTypeOf(csrio.vpu)) // Todo
 
+  ctrlBlock.io.toDecode.vsetvlVType := 0.U.asTypeOf(ctrlBlock.io.toDecode.vsetvlVType)
+  ctrlBlock.io.toDecode.vstart := 0.U
+  vecRegion.foreach { vecRegion =>
   val fromIntExuVsetVType = intRegion.io.vtype.getOrElse(0.U.asTypeOf((Valid(new VType))))
   val fromVfExuVsetVType = vecRegion.io.vtype.getOrElse(0.U.asTypeOf((Valid(new VType))))
   val fromVsetVType = Mux(fromIntExuVsetVType.valid, fromIntExuVsetVType.bits, fromVfExuVsetVType.bits)
@@ -452,6 +482,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   csrio.vpu.set_vtype.bits := ZeroExt(vtype, XLEN)
   csrio.vpu.vl := vecRegion.io.diffVl.getOrElse(0.U.asTypeOf(UInt(VlData().dataWidth.W)))
   csrio.vpu.dirty_vs := ctrlBlock.io.robio.csr.dirty_vs
+  }
   csrio.exception := ctrlBlock.io.robio.exception
   csrio.robDeqPtr := ctrlBlock.io.robio.robDeqPtr
   csrio.memExceptionVAddr := io.mem.exceptionAddr.vaddr
@@ -471,14 +502,18 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   intRegion.io.vxrm := csrio.vpu.vxrm
   fpRegion.io.frm := csrio.fpu.frm
   fpRegion.io.vxrm := csrio.vpu.vxrm
+  vecRegion.foreach { vecRegion =>
   vecRegion.io.frm := csrio.fpu.frm
   vecRegion.io.vxrm := csrio.vpu.vxrm
   vecRegion.io.vstart.get := csrio.vpu.vstart
+  }
 
+  vecRegion.zip(vecExcpMod).foreach { case (vecRegion, vecExcpMod) =>
   vecExcpMod.i.fromExceptionGen := ctrlBlock.io.toVecExcpMod.excpInfo
   vecExcpMod.i.fromRab.logicPhyRegMap := ctrlBlock.io.toVecExcpMod.logicPhyRegMap
   vecExcpMod.i.fromRat := ctrlBlock.io.toVecExcpMod.ratOldPest
   vecExcpMod.i.fromVprf := vecRegion.io.toVecExcpMod.get
+  }
 
   io.mem.redirect := ctrlBlock.io.redirect
   issue.flatten.zip(toMem.flatten).foreach { case (sink, source) =>
@@ -518,7 +553,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     deq.fire && deq.bits.robIdx === ctrlBlock.io.robio.robDeqPtr
   ).reduce(_ || _)
   ctrlBlock.io.robio.topdownIQInfoVec.foreach(_ := intRegion.io.topdownIQInfoVec.get ++
-    fpRegion.io.topdownIQInfoVec.get ++ vecRegion.io.topdownIQInfoVec.get)
+    fpRegion.io.topdownIQInfoVec.get ++ vecRegion.toSeq.flatMap(_.io.topdownIQInfoVec.get))
 
   // mem io
   io.mem.robLsqIO <> ctrlBlock.io.robio.lsq
@@ -548,9 +583,12 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   topDownMod.io.fpTopDown.uopsIssued     := fpRegion.io.uopTopDown.uopsIssued
   topDownMod.io.fpTopDown.uopsIssuedCnt  := fpRegion.io.uopTopDown.uopsIssuedCnt
   topDownMod.io.fpTopDown.noStoreIssued  := fpRegion.io.uopTopDown.noStoreIssued
+  topDownMod.io.vecTopDown := 0.U.asTypeOf(topDownMod.io.vecTopDown)
+  vecRegion.foreach { vecRegion =>
   topDownMod.io.vecTopDown.uopsIssued    := vecRegion.io.uopTopDown.uopsIssued
   topDownMod.io.vecTopDown.uopsIssuedCnt := vecRegion.io.uopTopDown.uopsIssuedCnt
   topDownMod.io.vecTopDown.noStoreIssued := vecRegion.io.uopTopDown.noStoreIssued
+  }
   topDownMod.io.topDownInfo.replayAllocate := DelayN(io.topDownInfo.replayAllocate, 2)
   topDownMod.io.topDownInfo.sqFull  := DelayN(io.topDownInfo.sqFull, 2)
   topDownMod.io.topDownInfo.sbFull  := DelayN(io.topDownInfo.sbFull, 2)
@@ -572,9 +610,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
       ModuleNode(fpRegion),
       ModuleNode(topDownMod)
     ))
-    val leftResetTree = ResetGenNode(Seq(
-      ModuleNode(vecRegion),
-      ModuleNode(vecExcpMod),
+    val leftResetTree = ResetGenNode(vecRegion.toSeq.map(ModuleNode(_)) ++ vecExcpMod.toSeq.map(ModuleNode(_)) ++ Seq(
       ResetGenNode(Seq(
         ModuleNode(ctrlBlock),
         // ResetGenNode(Seq(
@@ -642,7 +678,7 @@ class BackendMemIO(implicit p: Parameters, params: BackendParams) extends XSBund
   // params alias
   private val LoadQueueSize = VirtualLoadQueueSize
   private val intSchdParams = params.intSchdParams.get
-  private val vecSchdParams = params.vecSchdParams.get
+  private val vecSchdParams = params.vecInterfaceParams
   // In/Out // Todo: split it into one-direction bundle
   val lsqEnqIO = Flipped(new LsqEnqIO)
   val robLsqIO = new RobLsqIO

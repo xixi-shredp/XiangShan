@@ -120,7 +120,7 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
     val wakeUpAll = new Bundle {
       val wakeUpInt: MixedVec[ValidIO[IssueQueueIQWakeUpBundle]] = Flipped(backendParams.intSchdParams.get.genIQWakeUpOutValidBundle)
       val wakeUpFp: MixedVec[ValidIO[IssueQueueIQWakeUpBundle]] = Flipped(backendParams.fpSchdParams.get.genIQWakeUpOutValidBundle)
-      val wakeUpVec: MixedVec[ValidIO[IssueQueueIQWakeUpBundle]] = Flipped(backendParams.vecSchdParams.get.genIQWakeUpOutValidBundle)
+      val wakeUpVec: MixedVec[ValidIO[IssueQueueIQWakeUpBundle]] = Flipped(backendParams.vecInterfaceParams.genIQWakeUpOutValidBundle)
     }
     val og0Cancel = Input(ExuVec())
     val ldCancel = Vec(backendParams.LdExuCnt, Flipped(new LoadCancelIO))
@@ -169,7 +169,7 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
   for (i <- 0 until RenameWidth) {
     fromRenameUpdate(i).valid := fromRename(i).valid
     // v0 don't need srcLoadDependency, srcState unpdated with allSrcState
-    fromRenameUpdate(i).bits.srcLoadDependency(3) := 0.U.asTypeOf(fromRenameUpdate(i).bits.srcLoadDependency(3))
+    if (HasVPU) fromRenameUpdate(i).bits.srcLoadDependency(3) := 0.U.asTypeOf(fromRenameUpdate(i).bits.srcLoadDependency(3))
     fromRenameUpdate(i).bits.srcState := 0.U.asTypeOf(fromRenameUpdate(i).bits.srcState)
     fromRenameUpdate(i).bits.srcStateVl := 0.U // dontCare this
     connectSamePort(fromRenameUpdate(i).bits, fromRename(i).bits)
@@ -183,7 +183,7 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
 
   val renameWidth = io.fromRename.size
   // int fp vec v0
-  val numRegType = 4
+  val numRegType = if (HasVPU) 4 else 2
   val idxRegTypeInt = allFuConfigs.map(x => {
     x.srcData.map(xx => {
       xx.zipWithIndex.filter(y => IntRegSrcDataSet.contains(y._1)).map(_._2)
@@ -242,18 +242,20 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
   // BusyTable Modules
   val intBusyTable = Module(new BusyTable(numRegSrcInt * renameWidth, backendParams.numPregWb(IntData()), IntPhyRegs, IntWB()))
   val fpBusyTable = Module(new BusyTable(numRegSrcFp * renameWidth, backendParams.numPregWb(FpData()), FpPhyRegs, FpWB()))
-  val vecBusyTable = Module(new BusyTable(numRegSrcVf * renameWidth, backendParams.numPregWb(VecData()), VfPhyRegs, VfWB()))
-  val v0BusyTable = Module(new BusyTable(numRegSrcV0 * renameWidth, backendParams.numPregWb(V0Data()), V0PhyRegs, V0WB()))
-  val vlBusyTable = Module(new VlBusyTable(numRegSrcVl * renameWidth, backendParams.numPregWb(VlData()), VlPhyRegs, VlWB()))
+  val vecBusyTable = Option.when(HasVPU)(Module(new BusyTable(numRegSrcVf * renameWidth, backendParams.numPregWb(VecData()), VfPhyRegs, VfWB())))
+  val v0BusyTable = Option.when(HasVPU)(Module(new BusyTable(numRegSrcV0 * renameWidth, backendParams.numPregWb(V0Data()), V0PhyRegs, V0WB())))
+  val vlBusyTable = Option.when(HasVPU)(Module(new VlBusyTable(numRegSrcVl * renameWidth, backendParams.numPregWb(VlData()), VlPhyRegs, VlWB())))
 
-  val busyTables = Seq(intBusyTable, fpBusyTable, vecBusyTable, v0BusyTable)
+  val busyTables = Seq(intBusyTable, fpBusyTable) ++ vecBusyTable.toSeq ++ v0BusyTable.toSeq
   val wbPregs = Seq(io.wbPregsInt, io.wbPregsFp, io.wbPregsVec, io.wbPregsV0)
-  val idxRegType = Seq(idxRegTypeInt, idxRegTypeFp, idxRegTypeVec, idxRegTypeV0)
+  val idxRegType = Seq(idxRegTypeInt, idxRegTypeFp) ++ (if (HasVPU) Seq(idxRegTypeVec, idxRegTypeV0) else Seq.empty)
   val allocPregsValid = Wire(Vec(busyTables.size, Vec(RenameWidth, Bool())))
   allocPregsValid(0) := VecInit(fromRename.map(x => x.valid && x.bits.rfWen && !x.bits.isMove))
   allocPregsValid(1) := VecInit(fromRename.map(x => x.valid && x.bits.fpWen))
+  if (HasVPU) {
   allocPregsValid(2) := VecInit(fromRename.map(x => x.valid && x.bits.vecWen))
   allocPregsValid(3) := VecInit(fromRename.map(x => x.valid && x.bits.v0Wen))
+  }
   val allocPregs = Wire(Vec(busyTables.size, Vec(RenameWidth, ValidIO(UInt(PhyRegIdxWidth.W)))))
   allocPregs.zip(allocPregsValid).map(x =>{
     x._1.zip(x._2).zipWithIndex.map{case ((sink, source), i) => {
@@ -272,6 +274,7 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
     b.io.allocPregs := a
   }}
 
+  vlBusyTable.foreach { vlBusyTable =>
   vlBusyTable.io match {
     case in =>
       in.wakeUpInt := 0.U.asTypeOf(in.wakeUpInt)
@@ -289,6 +292,8 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
       }
   }
   vlBusyTable.io_vl_Wb.vlWriteBackInfo := io.vlWriteBackInfo
+
+  }
 
   rcTagTable.io.allocPregs.zip(allocPregs(0)).map(x => x._1 := x._2)
   println(s"rcTagTable.io.wakeupFromIQ.length: ${rcTagTable.io.wakeupFromIQ.length}")
@@ -355,11 +360,13 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
         }
       }
     }
-    allSrcStateVl(i) := vlBusyTable.io.read(i).resp || !fromRename(i).bits.vlRen
+    allSrcStateVl(i) := vlBusyTable.map(_.io.read(i).resp).getOrElse(true.B) || !fromRename(i).bits.vlRen
   }
 
   // eliminate old vd
   val ignoreOldVdVec = Wire(Vec(renameWidth, Bool()))
+  ignoreOldVdVec := 0.U.asTypeOf(ignoreOldVdVec)
+  vlBusyTable.foreach { vlBusyTable =>
   for (i <- 0 until renameWidth){
     // numRegSrcVf - 1 is old vd
     var j = numRegSrcVf - 1
@@ -379,6 +386,8 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
     val ignoreOldVd = vlBusyTable.io.read(i).resp && vlIsNonZero && !isDependOldVd && (ignoreTail || ignoreWhole)
     ignoreOldVdVec(i) := readEn && ignoreOldVd
     allSrcState(i)(j)(k) := readEn && (busyTables(k).io.read(readidx).resp || ignoreOldVd) || SrcType.isImm(fromRename(i).bits.srcType(j))
+  }
+
   }
 
   // Singlestep should only commit one machine instruction after dret, and then hart enter debugMode according to singlestep exception.
@@ -573,7 +582,9 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
       !lsqRecoverStall && !fromRename(i).bits.isMove && !fromRename(i).bits.hasException && !fromRenameUpdate(i).bits.singleStep
     fromRename(i).ready := allowDispatch(i) && !uopBlockByIQ(i) && thisCanActualOut(i) && !lsqRecoverStall
     // update src type if eliminate old vd
+    if (HasVPU) {
     fromRenameUpdate(i).bits.srcType(numRegSrcVf - 1) := Mux(ignoreOldVdVec(i), SrcType.no, fromRename(i).bits.srcType(numRegSrcVf - 1))
+    }
   }
   val dispatchBlock = fromRename.map(_.valid).reduce(_ || _) && !io.toRenameAllFire
   for (i <- 0 until RenameWidth){
@@ -912,7 +923,11 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
     temp += issue.numEnq
     ready
   }
-  val fuTypeMapIQIdx = fuMapIQIdx.map(_._2)
+  // Diagnostics are indexed by the complete FuType one-hot ID space.
+  // Scalar configurations omit vector IDs, which must read as zero capacity.
+  val fuTypeMapIQIdx = (0 until FuType.num).map { id =>
+    fuMapIQIdx.filter(_._1.fuType.id == id).flatMap(_._2).distinct
+  }
   val issueQueueStallMatrix = allIssueParams.zipWithIndex.map { case (issue, iqidx) => {
     val result = uopSelIQMatrix.map(_(iqidx)).map(x => (!iqReadyVec(iqidx).orR && x.orR && x <= issue.numEnq.U) || x > issue.numEnq.U)
     result
@@ -925,7 +940,7 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with 
   val dispatchlsqBubbleVec = VecInit(allowDispatch.map(!_))
 
   val fuMapIQReadyCntVec = fuTypeMapIQIdx.map { iqVec =>
-    iqVec.map( iqidx => iqReadyVec(iqidx)).reduce(_ +& _)
+    iqVec.map(iqidx => iqReadyVec(iqidx)).foldLeft(0.U)(_ +& _)
   }
   val fuMapIQBandWidthVec = Wire(Vec(FuType.num, UInt(log2Ceil(IQEnqSum).W)))
   fuMapIQBandWidthVec := fuTypeMapIQIdx.map { iqVec =>

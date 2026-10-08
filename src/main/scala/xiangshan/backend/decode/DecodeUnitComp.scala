@@ -106,16 +106,17 @@ class DecodeUnitCompIO(implicit p: Parameters) extends XSBundle {
 class DecodeUnitComp()(implicit p : Parameters) extends XSModule with DecodeUnitConstants with VectorConstants {
   val io = IO(new DecodeUnitCompIO)
 
+  if (HasVPU) {
   // alias
-  private val inReady = io.in.ready
-  private val inValid = io.in.valid
-  private val inDecodedInst = WireInit(io.in.bits.simpleDecodedInst)
-  private val inInstFields = io.in.bits.simpleDecodedInst.instr.asTypeOf(new XSInstBitFields)
-  private val inUopInfo = io.in.bits.uopInfo
-  private val outValids = io.out.complexDecodedInsts.map(_.valid)
-  private val outReadys = io.out.complexDecodedInsts.map(_.ready)
-  private val outDecodedInsts = io.out.complexDecodedInsts.map(_.bits)
-  private val outComplexNum = io.complexNum
+  val inReady = io.in.ready
+  val inValid = io.in.valid
+  val inDecodedInst = WireInit(io.in.bits.simpleDecodedInst)
+  val inInstFields = io.in.bits.simpleDecodedInst.instr.asTypeOf(new XSInstBitFields)
+  val inUopInfo = io.in.bits.uopInfo
+  val outValids = io.out.complexDecodedInsts.map(_.valid)
+  val outReadys = io.out.complexDecodedInsts.map(_.ready)
+  val outDecodedInsts = io.out.complexDecodedInsts.map(_.bits)
+  val outComplexNum = io.complexNum
 
   val maxUopSize = MaxUopSize
   when (io.in.fire && io.in.bits.simpleDecodedInst.isVset) {
@@ -129,7 +130,7 @@ class DecodeUnitComp()(implicit p : Parameters) extends XSModule with DecodeUnit
   val latchedInst = RegEnable(inDecodedInst, inValid && inReady)
   val latchedUopInfo = RegEnable(inUopInfo, inValid && inReady)
   //input bits
-  private val instFields: XSInstBitFields = latchedInst.instr.asTypeOf(new XSInstBitFields)
+  val instFields: XSInstBitFields = latchedInst.instr.asTypeOf(new XSInstBitFields)
 
   val src1 = Cat(0.U(1.W), instFields.RS1)
   val src2 = Cat(0.U(1.W), instFields.RS2)
@@ -2059,4 +2060,97 @@ class DecodeUnitComp()(implicit p : Parameters) extends XSModule with DecodeUnit
 //  io.deq.complexNum := complexNum
 //  io.deq.validToRename := validToRename
 //  io.deq.readyToIBuf := readyToIBuf
+  } else {
+    // Four scalar AMOCAS uops fit in the six-wide BackendV2 rename bundle.
+    require(RenameWidth >= 4)
+    val active = RegInit(false.B)
+    val latchedInst = RegEnable(io.in.bits.simpleDecodedInst, io.in.fire)
+    val instFields = latchedInst.instr.asTypeOf(new XSInstBitFields)
+    val src1 = Cat(0.U(1.W), instFields.RS1)
+    val src2 = Cat(0.U(1.W), instFields.RS2)
+    val dest = Cat(0.U(1.W), instFields.RD)
+    val typeOfSplit = latchedInst.uopSplitType
+    val numOfWB = Mux(typeOfSplit === UopSplitType.AMO_CAS_Q, 4.U, 2.U)
+    val csBundle = Wire(Vec(4, new DecodeOutUop))
+    csBundle.zipWithIndex.foreach { case (uop, index) =>
+      uop := latchedInst
+      uop.numWB := numOfWB
+      uop.firstUop := (index == 0).B
+      uop.lastUop := index.U === numOfWB - 1.U
+      uop.vecWen := false.B
+      uop.v0Wen := false.B
+      uop.vlWen := false.B
+      uop.vlRen := false.B
+      uop.vpu := 0.U.asTypeOf(uop.vpu)
+      uop.vlsInstr := false.B
+    }
+  switch(typeOfSplit) {
+    is(UopSplitType.AMO_CAS_BHWD) {
+      val amocasOp = latchedInst.fuOpType(LSUOpType.AMOFuOpWidth - 1, 0)
+      csBundle(0).uopIdx := 0.U
+      csBundle(0).fuOpType := Cat(1.U(2.W), amocasOp)
+      csBundle(0).lsrc(0) := 0.U
+      csBundle(0).lsrc(1) := src2
+      csBundle(0).rfWen := false.B
+      csBundle(0).waitForward := true.B
+      csBundle(0).blockBackward := false.B
+      csBundle(0).flushPipe := false.B
+
+      csBundle(1).uopIdx := 1.U
+      csBundle(1).fuOpType := Cat(0.U(2.W), amocasOp)
+      csBundle(1).lsrc(0) := src1
+      csBundle(1).lsrc(1) := dest
+      csBundle(1).waitForward := false.B
+      csBundle(1).blockBackward := true.B
+    }
+    is(UopSplitType.AMO_CAS_Q) {
+      csBundle(0).uopIdx := 0.U
+      csBundle(0).fuOpType := Cat(1.U(2.W), LSUOpType.amocas_q)
+      csBundle(0).lsrc(0) := 0.U
+      csBundle(0).lsrc(1) := src2
+      csBundle(0).rfWen := false.B
+      csBundle(0).waitForward := true.B
+      csBundle(0).blockBackward := false.B
+      csBundle(0).flushPipe := false.B
+
+      csBundle(1).uopIdx := 1.U
+      csBundle(1).fuOpType := Cat(0.U(2.W), LSUOpType.amocas_q)
+      csBundle(1).lsrc(0) := src1
+      csBundle(1).lsrc(1) := dest
+      csBundle(1).waitForward := false.B
+      csBundle(1).blockBackward := false.B
+
+      csBundle(2).uopIdx := 2.U
+      csBundle(2).fuOpType := Cat(3.U(2.W), LSUOpType.amocas_q)
+      csBundle(2).lsrc(0) := 0.U
+      csBundle(2).lsrc(1) := Mux(src2 === 0.U, 0.U, src2 + 1.U)
+      csBundle(2).rfWen := false.B
+      csBundle(2).waitForward := false.B
+      csBundle(2).blockBackward := false.B
+
+      csBundle(3).uopIdx := 3.U
+      csBundle(3).fuOpType := Cat(2.U(2.W), LSUOpType.amocas_q)
+      csBundle(3).lsrc(0) := 0.U
+      csBundle(3).lsrc(1) := Mux(dest === 0.U, 0.U, dest + 1.U)
+      csBundle(3).ldest := Mux(dest === 0.U, 0.U, dest + 1.U)
+      csBundle(3).waitForward := false.B
+      csBundle(3).blockBackward := true.B
+    }
+
+  }
+    io.complexNum := Mux(active && io.out.complexDecodedInsts.head.ready, numOfWB, 0.U)
+    io.in.ready := !active || io.out.complexDecodedInsts.head.ready
+    io.out.complexDecodedInsts.zipWithIndex.foreach { case (out, index) =>
+      out.valid := active && io.out.complexDecodedInsts.head.ready && index.U < numOfWB
+      out.bits := (if (index < 4) csBundle(index) else 0.U.asTypeOf(out.bits))
+    }
+    when(io.redirect) {
+      active := false.B
+    }.elsewhen(io.in.fire) {
+      active := true.B
+    }.elsewhen(io.out.complexDecodedInsts.head.fire) {
+      active := false.B
+    }
+  }
+
 }

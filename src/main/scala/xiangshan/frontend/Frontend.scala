@@ -178,6 +178,7 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
     hintProfileDpi.io.baselineValid := bpu.io.hintProfileEvent.bits.baselineValid
     hintProfileDpi.io.blockStart := bpu.io.hintProfileEvent.bits.blockStart
     hintProfileDpi.io.queryCycle := bpu.io.hintProfileEvent.bits.queryCycle
+    hintProfileDpi.io.ftqTag := bpu.io.hintProfileEvent.bits.ftqTag
     hintProfileDpi.io.ith := bpu.io.hintProfileEvent.bits.ith
     hintProfileDpi.io.lhr := bpu.io.hintProfileEvent.bits.lhr
     hintProfileDpi.io.call := bpu.io.hintProfileEvent.bits.call
@@ -194,6 +195,14 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
     hintReplayDpi.io.usedHint := bpu.io.hintReplayEvent.bits.usedHint
     hintReplayDpi.io.contextHit := bpu.io.hintReplayEvent.bits.contextHit
     hintReplayDpi.io.confAtPrediction := bpu.io.hintReplayEvent.bits.confAtPrediction
+    hintReplayDpi.io.ftqTag := bpu.io.hintReplayEvent.bits.ftqTag
+    hintReplayDpi.io.queryCycle := bpu.io.hintReplayEvent.bits.queryCycle
+    hintReplayDpi.io.ith := bpu.io.hintReplayEvent.bits.ith
+    hintReplayDpi.io.lhr := bpu.io.hintReplayEvent.bits.lhr
+    hintReplayDpi.io.call := bpu.io.hintReplayEvent.bits.call
+    hintReplayDpi.io.ret := bpu.io.hintReplayEvent.bits.ret
+    hintReplayDpi.io.mask := bpu.io.hintReplayEvent.bits.mask
+    hintReplayDpi.io.contextHash := bpu.io.hintReplayEvent.bits.contextHash
   } else {
     bpu.io.hintLoad.valid := false.B
     bpu.io.hintLoad.bits := 0.U.asTypeOf(bpu.io.hintLoad.bits)

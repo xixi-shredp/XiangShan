@@ -3,11 +3,12 @@ package xiangshan.frontend.bpu.hint
 import chisel3._
 import chisel3.util.HasBlackBoxInline
 
-/** Simulation-only committed-event sink. */
+/** Simulation-only FTQ retirement callback sink; ROB identity is audited separately. */
 class HintProfileDpi extends BlackBox with HasBlackBoxInline {
   val io = IO(new Bundle {
     val clock = Input(Clock())
     val valid = Input(Bool())
+    val ftqTag = Input(UInt(7.W))
     val pc = Input(UInt(64.W))
     val actual = Input(UInt(64.W))
     val baselinePc = Input(UInt(64.W))
@@ -25,6 +26,7 @@ class HintProfileDpi extends BlackBox with HasBlackBoxInline {
   setInline("HintProfileDpi.sv", """
 module HintProfileDpi (
   input logic clock, valid,
+  input logic [6:0] ftqTag,
   input logic [63:0] pc, actual, baselinePc, baselineTarget,
   input logic baselineValid,
   input logic [63:0] blockStart, queryCycle,
@@ -36,12 +38,12 @@ module HintProfileDpi (
     input bit baselineValid,
     input longint unsigned blockStart, queryCycle,
     input int unsigned ith, lhr, call, ret,
-    input bit eligible, observed);
+    input bit eligible, observed, input int unsigned ftqTag);
   always @(posedge clock) if (valid)
     h2p_hint_record(pc, actual, baselinePc, baselineTarget,
                     baselineValid, blockStart, queryCycle,
                     {4'b0, ith}, {4'b0, lhr}, {4'b0, call}, {4'b0, ret},
-                    eligible, observed);
+                    eligible, observed, {25'b0, ftqTag});
 endmodule
 """)
 }

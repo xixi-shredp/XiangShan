@@ -104,6 +104,10 @@ class PerfMeta(implicit p: Parameters) extends FtqBundle {
   // Whether a position is a Control-Flow Instruction
   val isCfi:   Vec[Bool]            = Vec(FetchBlockInstNum, Bool())
   val cfiAttr: Vec[BranchAttribute] = Vec(FetchBlockInstNum, new BranchAttribute)
+  // Verilator observation, populated only by the same valid resolve prefix as
+  // isCfi. This is not a prediction guard, history, or recoverable Hint state.
+  val debug_actualTarget: Option[Vec[UInt]] = Option.when(!env.FPGAPlatform)(Vec(FetchBlockInstNum, UInt(VAddrBits.W)))
+  val debug_actualPc: Option[Vec[UInt]] = Option.when(!env.FPGAPlatform)(Vec(FetchBlockInstNum, UInt(VAddrBits.W)))
 
   // This block mispredicted
   // no matter how many mispredictions happened before, count correct-path only

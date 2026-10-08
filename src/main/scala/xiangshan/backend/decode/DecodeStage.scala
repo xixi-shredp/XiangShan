@@ -228,11 +228,13 @@ class DecodeStage(implicit p: Parameters) extends XSModule
     inst.bits.srcType(1) := Mux(finalDecodedInst(i).vpu.isReverse, finalDecodedInst(i).srcType(0), finalDecodedInst(i).srcType(1))
     inst.bits.v0Wen := finalDecodedInst(i).vecWen && finalDecodedInst(i).ldest === 0.U || finalDecodedInst(i).v0Wen
     inst.bits.vecWen := finalDecodedInst(i).vecWen && finalDecodedInst(i).ldest =/= 0.U
+    if (HasVPU) {
     // when src0/src1/src2 read V0, src3 read V0
     val srcType0123HasV0 = finalDecodedInst(i).srcType.zip(finalDecodedInst(i).lsrc).take(4).map { case (s, l) =>
       SrcType.isVp(s) && (l === 0.U)
     }.reduce(_ || _)
     inst.bits.srcType(3) := Mux(srcType0123HasV0, SrcType.v0, finalDecodedInst(i).srcType(3))
+    }
     inst.bits.debug.foreach(_.debug_seqNum.uopIdx := inst.bits.uopIdx)
   }
 
@@ -259,6 +261,7 @@ class DecodeStage(implicit p: Parameters) extends XSModule
     io.fpRat(i)(2).addr := io.out(i).bits.lsrc(2)
     io.fpRat(i).foreach(_.hold := !io.out(i).ready)
 
+    if (HasVPU) {
     // Vec instructions
     // TODO: vec uop dividers need change this
     io.vecRat(i)(0).addr := io.out(i).bits.lsrc(0) // vs1
@@ -271,6 +274,13 @@ class DecodeStage(implicit p: Parameters) extends XSModule
 
     io.vlRat(i).addr := Vl_IDX.U // vl
     io.vlRat(i).hold := !io.out(i).ready
+    } else {
+      // Retained shared interfaces have no vector RAT behind them in NoV.
+      io.v0Rat(i).addr := 0.U
+      io.v0Rat(i).hold := false.B
+      io.vlRat(i).addr := 0.U
+      io.vlRat(i).hold := false.B
+    }
   }
 
   /** whether valid input requests from frontend exists */

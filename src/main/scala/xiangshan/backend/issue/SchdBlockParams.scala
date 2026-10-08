@@ -98,13 +98,13 @@ case class SchdBlockParams(
 
   def needOg2Resp: Boolean = isVecSchd
 
-  def needSrcFrm: Boolean = issueBlockParams.map(_.needSrcFrm).reduce(_ || _)
+  def needSrcFrm: Boolean = issueBlockParams.exists(_.needSrcFrm)
 
-  def needSrcVxrm: Boolean = issueBlockParams.map(_.needSrcVxrm).reduce(_ || _)
+  def needSrcVxrm: Boolean = issueBlockParams.exists(_.needSrcVxrm)
 
-  def writeVConfig: Boolean = issueBlockParams.map(_.writeVConfig).reduce(_ || _)
+  def writeVConfig: Boolean = issueBlockParams.exists(_.writeVConfig)
 
-  def writeVType: Boolean = issueBlockParams.map(_.writeVType).reduce(_ || _)
+  def writeVType: Boolean = issueBlockParams.exists(_.writeVType)
 
   def numRedirect: Int = issueBlockParams.map(_.numRedirect).sum
 

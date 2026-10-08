@@ -67,7 +67,9 @@ class IBuffer(implicit p: Parameters) extends IBufferModule with HasCircularQueu
   private val resumingVType   = io.fromBackend.resumingVType
 
   // Modules
-  private val vtypeGen = Module(new VTypeGen)
+  private val vtypeGen = Option.when(HasVPU)(Module(new VTypeGen))
+  private val vtypeGenIn = vtypeGen.map(_.in).getOrElse(WireDefault(0.U.asTypeOf(new VTypeGen.In)))
+  private val vtypeGenOut = vtypeGen.map(_.out).getOrElse(WireDefault(0.U.asTypeOf(new VTypeGen.Out)))
 
   // cross-module parameters check
   require(
@@ -334,38 +336,38 @@ class IBuffer(implicit p: Parameters) extends IBufferModule with HasCircularQueu
   // VTypeGen's connection
   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-  vtypeGen.in.canUpdateVType  := !resumingVType && (decodeCanAccept || outputEntriesIsNotFull)
-  vtypeGen.in.walkToArchVType := io.fromBackend.walkToArchVType
-  vtypeGen.in.walkVType       := io.fromBackend.walkVType
-  vtypeGen.in.vsetvlVType     := io.fromBackend.vsetvlVType
-  vtypeGen.in.commitVType     := io.fromBackend.commitVType
+  vtypeGenIn.canUpdateVType  := !resumingVType && (decodeCanAccept || outputEntriesIsNotFull)
+  vtypeGenIn.walkToArchVType := io.fromBackend.walkToArchVType
+  vtypeGenIn.walkVType       := io.fromBackend.walkVType
+  vtypeGenIn.vsetvlVType     := io.fromBackend.vsetvlVType
+  vtypeGenIn.commitVType     := io.fromBackend.commitVType
   for (i <- 0 until DecodeWidth) {
     when(resumingVType) {
-      vtypeGen.in.insts(i).valid := false.B
+      vtypeGenIn.insts(i).valid := false.B
     }.elsewhen(decodeCanAccept) {
-      vtypeGen.in.insts(i).valid := outputEntriesFromDeqNext(i).valid
+      vtypeGenIn.insts(i).valid := outputEntriesFromDeqNext(i).valid
     }.elsewhen(outputEntriesIsNotFull) {
       // Only lanes carrying a genuinely new deq entry (within numDeq) are fed to VTypeGen.
-      vtypeGen.in.insts(i).valid := Mux(i.U < outputEntriesValidNum, false.B, (i.U - outputEntriesValidNum) < numDeq)
+      vtypeGenIn.insts(i).valid := Mux(i.U < outputEntriesValidNum, false.B, (i.U - outputEntriesValidNum) < numDeq)
     }.otherwise {
-      vtypeGen.in.insts(i).valid := false.B
+      vtypeGenIn.insts(i).valid := false.B
     }
-    vtypeGen.in.insts(i).bits := outputEntriesFromDeqNext(i).bits.inst
+    vtypeGenIn.insts(i).bits := outputEntriesFromDeqNext(i).bits.inst
   }
 
   // update vtype field, overwrite the assignment of outputEntriesNext above
   for (i <- outputEntriesNext.indices) {
     when(decodeCanAccept && !resumingVType) {
       // vtype can not be from bypass
-      outputEntriesNext(i).bits.vtype     := vtypeGen.out.vtype(i)
-      outputEntriesNext(i).bits.specvtype := vtypeGen.out.specvtype(i)
+      outputEntriesNext(i).bits.vtype     := vtypeGenOut.vtype(i)
+      outputEntriesNext(i).bits.specvtype := vtypeGenOut.specvtype(i)
     }.elsewhen(outputEntriesIsNotFull && !resumingVType) {
       when(i.U < outputEntriesValidNum) {
         outputEntriesNext(i).bits.vtype     := outputEntries(i).bits.vtype
         outputEntriesNext(i).bits.specvtype := outputEntries(i).bits.specvtype
       }.otherwise {
-        outputEntriesNext(i).bits.vtype     := vtypeGen.out.vtype(i)
-        outputEntriesNext(i).bits.specvtype := vtypeGen.out.specvtype(i)
+        outputEntriesNext(i).bits.vtype     := vtypeGenOut.vtype(i)
+        outputEntriesNext(i).bits.specvtype := vtypeGenOut.specvtype(i)
       }
     }
   }
