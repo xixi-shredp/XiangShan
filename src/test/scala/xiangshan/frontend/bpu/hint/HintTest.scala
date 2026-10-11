@@ -9,18 +9,63 @@ import org.scalatest.flatspec.AnyFlatSpec
 import top.BackendV2NoRVVNoLLCConfig
 import xiangshan.{XSCoreParamsKey, XSTileKey}
 
+// One elaboration preserves the production SRAM Definition identity and
+// connects the same normal-mode global control distribution used by Frontend.
+class HintSramTestTop(implicit p: org.chipsalliance.cde.config.Parameters) extends Module {
+  val predictor=Module(new Hint)
+  val contextTable=Module(new HintContextTable)
+  val slotTable=Module(new HintSlotTable)
+  val io=IO(new Bundle {
+    val hint=predictor.io.cloneType
+    val context=contextTable.io.cloneType
+    val slot=slotTable.io.cloneType
+  })
+  io.hint <> predictor.io
+  io.context <> contextTable.io
+  io.slot <> slotTable.io
+  val normalBroadcast=utility.sram.SramHelper.genBroadCastBundleTop()
+  normalBroadcast := 0.U.asTypeOf(normalBroadcast)
+}
+
+class HintObserverLinkPreflight extends Module {
+  val io=IO(new Bundle { val input=Input(UInt(8.W));val output=Output(UInt(8.W)) })
+  io.output := RegNext(io.input,0.U)
+  val observer=Module(new xiangshan.frontend.ftq.HintPendingDpi)
+  observer.io.clock := clock
+  observer.io.pending := io.input
+  observer.io.outstanding := 0.U
+  observer.io.meta := 0.U
+}
+
 class HintTest extends AnyFlatSpec with ChiselSim {
   private val config = new BackendV2NoRVVNoLLCConfig
   implicit val params: org.chipsalliance.cde.config.Parameters = config.alterPartial {
     case XSCoreParamsKey => config(XSTileKey).head
   }
 
-  // Match the production emulator graph optimization; the default leaves an
-  // enormous expanded confidence-log expression in one C++ function.
+  // Keep the observer implementation in the test classpath, rather than
+  // depending on a precompiled object in an experiment results directory.
+  private lazy val observerSource: String = {
+    val directory = Files.createTempDirectory("hint-observer-source-")
+    val source = directory.resolve("observer_only_stubs.cpp")
+    directory.toFile.deleteOnExit()
+    source.toFile.deleteOnExit()
+    val input = getClass.getResourceAsStream("/hint/observer_only_stubs.cpp")
+    require(input != null, "missing Hint observer test resource")
+    try Files.copy(input, source)
+    finally input.close()
+    source.toAbsolutePath.toString
+  }
+
+  // Test-only low C++ optimization keeps compilation practical. The hardware,
+  // cycle schedule and assertions remain identical to the production DUT.
+  // Link only the three no-return observers; actual loader has a separate test.
   override implicit def commonSettingsModifications: svsim.CommonSettingsModifications =
     new svsim.CommonSettingsModifications {
       override def apply(settings: svsim.CommonCompilationSettings): svsim.CommonCompilationSettings =
-        settings.copy(optimizationStyle = svsim.CommonCompilationSettings.OptimizationStyle.OptimizeForSimulationSpeed)
+        settings.copy(
+          optimizationStyle = svsim.CommonCompilationSettings.OptimizationStyle.OptimizeForCompilationSpeed,
+          linkLibraryPaths = settings.linkLibraryPaths :+ observerSource)
     }
 
   // Keep this large table model in small C++ units while retaining the
@@ -36,9 +81,19 @@ class HintTest extends AnyFlatSpec with ChiselSim {
     }
 
   behavior of "Continuous Hint with finite resources"
-  it should "preserve independent histories and ordered confidence under wrap pressure and redirects" in {
-    simulate(new Hint, firtoolOpts = Array("-O=release",
-      "--lowering-options=explicitBitcast,disallowLocalVariables,disallowPortDeclSharing,locationInfoStyle=none")) { m =>
+  it should "preflight the real observer ABI and test compiler linkage" in {
+    simulate(new HintObserverLinkPreflight) { m =>
+      m.io.input.poke(0.U);m.reset.poke(true.B);m.clock.step(2);m.reset.poke(false.B)
+      m.io.input.poke(7.U);m.clock.step();m.io.output.expect(7.U)
+      println("HINT_OBSERVER_PUBLIC_LINK_PREFLIGHT_PASS")
+    }
+  }
+
+  it should "preserve histories and finite queues using the actual synchronous SRAM ports" in {
+    simulate(new HintSramTestTop, firtoolOpts=Array("-O=release",
+      "--lowering-options=explicitBitcast,disallowLocalVariables,disallowPortDeclSharing,locationInfoStyle=none")) { top =>
+      {
+        val m=new { val io=top.io.hint;val clock=top.clock;val reset=top.reset }
       val pcs = Vector.tabulate(16)(i => 0x1000 + i * 0x40)
       var recent = Vector.fill(16)(Vector.fill(4)(0)) // newest first; independent of physical ring
       var heads = Vector.fill(16)(0)
@@ -51,7 +106,7 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         val h = m.io.debugConfHead.get.peek().litValue
         val t = m.io.debugConfTail.get.peek().litValue
         val w = m.io.debugConfWrite.get.peek().litValue
-        assert((t-h+64)%64 <= 17 && (t-w+64)%64 <= 1)
+        assert((t-h+64)%64 <= 32 && (t-w+64)%64 <= (t-h+64)%64)
         val accepted = m.io.stats.confAccepted.peek().litValue
         val retired = m.io.stats.confRetired.peek().litValue
         val canceled = m.io.stats.confCanceled.peek().litValue
@@ -79,12 +134,29 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         m.io.commit.valid.poke(false.B); for(r<-m.io.resolve) { r.valid.poke(false.B); r.bits.offset.poke(0.U); r.bits.mispredict.poke(false.B); r.bits.sourceBackend.poke(true.B) }
         input(0x1000,0,0x2000,false)
         m.reset.poke(true.B); m.clock.step(3); m.reset.poke(false.B)
-        recent=Vector.fill(16)(Vector.fill(4)(0)); heads=Vector.fill(16)(0); tick(4096)
+        recent=Vector.fill(16)(Vector.fill(4)(0)); heads=Vector.fill(16)(0)
+        var waited=0
+        while(!m.io.tableReady.peek().litToBoolean && waited<20000){tick();waited+=1}
+        assert(m.io.tableReady.peek().litToBoolean,"actual SRAM reset completion timeout")
       }
       def load(kind: Int,index: Int,value: BigInt): Unit = {
+        // Offline loading starts only after inactive prediction tokens drain.
+        // This drives normal stage consumption rather than forcing private state.
+        m.io.enabled.expect(false.B);m.io.profile.expect(false.B)
+        if(!m.io.tableReady.peek().litToBoolean){
+          m.io.s2Fire.poke(true.B);m.io.s3Fire.poke(true.B);tick(2)
+          m.io.s2Fire.poke(false.B);m.io.s3Fire.poke(false.B)
+        }
         m.io.load.bits.kind.poke(kind.U); m.io.load.bits.index.poke(index.U)
         m.io.load.bits.data.poke(value.U); m.io.load.valid.poke(true.B)
-        m.io.load.ready.expect(true.B); tick(); m.io.load.valid.poke(false.B)
+        var waited=0
+        while(!m.io.load.ready.peek().litToBoolean && waited<20000){tick();waited+=1}
+        assert(m.io.load.ready.peek().litToBoolean,"actual SRAM load acceptance timeout")
+        m.io.tableReady.expect(false.B) // No old resetDone acknowledgement on a load edge.
+        tick(); m.io.load.valid.poke(false.B)
+        if(kind==0)m.io.tableReady.expect(false.B) // Clear must cross the real reset edge.
+        while(!m.io.tableReady.peek().litToBoolean && waited<20000){tick();waited+=1}
+        assert(m.io.tableReady.peek().litToBoolean,"actual SRAM load completion timeout")
       }
       def cam(index: Int,pc: Int,mask: Int): Unit =
         load(1,index,(BigInt(1)<<51)|(BigInt(mask)<<47)|BigInt(pc>>1))
@@ -143,6 +215,11 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         query(0x1000,id);m.io.s3Lookup.contextHit.expect(true.B)
         m.io.debugSelectedConf.get.expect(expected.U);m.io.s3Lookup.usable.expect((expected!=0).B)
       }
+
+      // Clear-only is the exact empty-image hardware sequence. Old raw
+      // resetDone is high before acceptance, but completion must wait for reset.
+      reset();load(0,0,BigInt(0));m.io.tableReady.expect(true.B)
+      println("HINT_SRAM_CLEAR_ONLY_REAL_DONE_PASS old_done_edge_rejected=1 real_sram_reset_complete=1")
 
       // Actual same-FTQ positional counterexample: redirect retains FTQ 10
       // at its earlier ordinary branch (0xffe), so H2P 0x1000 must be killed.
@@ -295,7 +372,7 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       for(i<-0 until 16){query(0x1000,i,0x2000+(i&3)*2);m.io.s3Lookup.usable.expect(true.B);confirm()}
       m.io.stats.recordAllocate.expect(16.U)
       query(0x1000,16,0x2006);m.io.s3Lookup.usable.expect(false.B);confirm()
-      m.io.stats.recordAllocate.expect(16.U);m.io.stats.metadataFallback.expect(1.U);probe(17)
+      m.io.stats.recordAllocate.expect(16.U);m.io.canAccept.expect(true.B);probe(17)
       resolve(0,0x2000);commit(0);tick(8)
       query(0x1000,17);m.io.s3Lookup.usable.expect(true.B);confirm();m.io.stats.recordAllocate.expect(17.U)
       println("HINT_CONTINUOUS_METADATA_PASS capacity=16 normal_s1_blocked=0")
@@ -334,9 +411,11 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         tick();localWrite(0x1000,0x2000)
       }
       m.io.s1Fire.poke(false.B);m.io.s2Fire.poke(false.B)
+      m.io.stats.confApply.expect(0.U) // A pending confidence write cannot steal any S1 read.
+      assert(m.io.debugConfTail.get.peek().litValue!=m.io.debugConfWrite.get.peek().litValue)
       confProbe(13,0)
       m.io.stats.confApply.expect(1.U);m.io.debugSelectedConf.get.expect(0.U)
-      assert(m.io.stats.lookupPortFallback.peek().litValue>0)
+      m.io.stats.lookupPortFallback.expect(0.U)
 
       reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
       var saved11:Option[Saved]=None;var saved12:Option[Saved]=None
@@ -403,6 +482,90 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       }
       println("HINT_CONTINUOUS_S2_BROADCAST_PASS stalled_retired_log=1 apply_samecycle_transfer=1")
 
+      // Back-to-back independent set/way/slot identities expose a one-stage
+      // alignment mistake that repeated-PC tests cannot detect. Empty Context
+      // and absent CAM windows may carry held Slot bits, but cannot reuse them.
+      reset();cam(0,0x1000,0);cam(1,0x1040,0);cam(2,0x1080,0)
+      load(3,0,BigInt(0x2000>>1));load(3,1,BigInt(0x4000>>1))
+      load(2,0,(BigInt(1)<<24)|(BigInt(1)<<22)|BigInt(1))
+      load(2,65,(BigInt(1)<<24)|(BigInt(2)<<22)|(BigInt(1)<<17)|BigInt(1))
+      m.io.enabled.poke(true.B)
+      val streamPcs=Vector(0x1000,0x1040,0x1000,0x1080,0x1000,0x1800,0x1040)
+      for(cycle<-0 until streamPcs.size+2){
+        val pc=if(cycle<streamPcs.size)streamPcs(cycle) else 0x1800
+        input(pc,cycle,0x3000,false)
+        val s3Id=cycle-2
+        m.io.s1Fire.poke((cycle<streamPcs.size).B)
+        m.io.s2Fire.poke((cycle>=1 && cycle<streamPcs.size+1).B)
+        m.io.s3Fire.poke((s3Id>=0).B)
+        if(s3Id>=0){
+          val retiredPc=streamPcs(s3Id)
+          ptr(m.io.s3Ptr,s3Id);m.io.s3CfiPc.poke(retiredPc.U)
+          prediction(m.io.s3Prediction,true,0x3000)
+          val hasTarget=retiredPc==0x1000 || retiredPc==0x1040
+          m.io.s3Lookup.usable.expect(hasTarget.B)
+          m.io.s3Lookup.contextHit.expect(hasTarget.B)
+          if(hasTarget){
+            m.io.s3Lookup.pc.expect(retiredPc.U)
+            m.io.s3Lookup.way.expect((if(retiredPc==0x1040)1 else 0).U)
+            m.io.s3Lookup.target.expect((if(retiredPc==0x1040)0x4000 else 0x2000).U)
+            m.io.debugSelectedConf.get.expect((if(retiredPc==0x1040)2 else 1).U)
+          }
+        }
+        m.io.s3UsedHint.poke(m.io.s3Lookup.usable.peek().litToBoolean.B);tick()
+      }
+      m.io.s1Fire.poke(false.B);m.io.s2Fire.poke(false.B);m.io.s3Fire.poke(false.B)
+      m.io.s3UsedHint.poke(false.B)
+      println("HINT_SRAM_PIPELINE_IDENTITY_PASS independent_sets=2 independent_ways=2 stale_slot_miss_rejected=1 back_to_back=1")
+
+      // A real continuous S1/S2/S3 stream starves physical writes until the
+      // 32-entry confidence log fills. Full means Hint fallback, never a stalled
+      // ordinary S1. Those idle Hint-port cycles must make write/retire progress.
+      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
+      m.io.measureActive.poke(true.B)
+      var maxOutstanding=BigInt(0);var maxPending=BigInt(0)
+      val streamLength=120
+      for(cycle<-0 until streamLength+48){
+        val querying=cycle<streamLength
+        input(0x1000,cycle,0x2000,true)
+        ptr(m.io.s3Ptr,math.max(0,cycle-2))
+        m.io.s1Fire.poke(querying.B)
+        m.io.s2Fire.poke((cycle>=1 && cycle<streamLength+1).B)
+        m.io.s3Fire.poke((cycle>=2 && cycle<streamLength+2).B)
+        m.io.s3UsedHint.poke(m.io.s3Lookup.usable.peek().litToBoolean.B)
+        val resolveId=cycle-5;val retiringId=cycle-9
+        val r=m.io.resolve(0)
+        r.valid.poke((resolveId>=0 && resolveId<streamLength).B)
+        if(resolveId>=0 && resolveId<streamLength){
+          ptr(r.bits.ftqPtr,resolveId);r.bits.cfiPc.poke(0x1000.U)
+          r.bits.target.poke(0x2000.U);r.bits.eligible.poke(true.B)
+          r.bits.baselinePc.poke(0x1000.U);r.bits.baselineTarget.poke(0x3000.U)
+          r.bits.baselineValid.poke(true.B);r.bits.blockStart.poke(0x1000.U)
+        }
+        m.io.commit.valid.poke((retiringId>=0 && retiringId<streamLength).B)
+        if(retiringId>=0 && retiringId<streamLength)ptr(m.io.commit.bits,retiringId)
+        val h=m.io.debugConfHead.get.peek().litValue
+        val t=m.io.debugConfTail.get.peek().litValue
+        val w=m.io.debugConfWrite.get.peek().litValue
+        maxOutstanding=maxOutstanding.max((t-h+64)%64)
+        maxPending=maxPending.max((t-w+64)%64)
+        tick();if(querying)localWrite(0x1000,0x2000)
+      }
+      m.io.s1Fire.poke(false.B);m.io.s2Fire.poke(false.B);m.io.s3Fire.poke(false.B)
+      m.io.s3UsedHint.poke(false.B);m.io.resolve(0).valid.poke(false.B)
+      m.io.commit.valid.poke(false.B);m.io.measureActive.poke(false.B);tick(8)
+      assert(maxPending>1,s"did not exercise a genuine write backlog: $maxPending")
+      assert(maxOutstanding==32,s"did not exercise full confidence capacity: $maxOutstanding")
+      val acceptedStream=m.io.stats.confAccepted.peek().litValue
+      assert(acceptedStream>32,s"Hint did not resume after capacity fallback: $acceptedStream")
+      m.io.stats.confRetired.expect(acceptedStream.U)
+      m.io.stats.confApply.expect(acceptedStream.U)
+      assert(m.io.debugConfHead.get.peek().litValue==m.io.debugConfTail.get.peek().litValue)
+      assert(m.io.debugConfWrite.get.peek().litValue==m.io.debugConfTail.get.peek().litValue)
+      assert(m.io.stats.lookupPortFallback.peek().litValue>0,"full log must fall back")
+      confProbe(121,3)
+      println(s"HINT_SRAM_CONF_FULL_PROGRESS_PASS maxOutstanding=$maxOutstanding maxPending=$maxPending accepted=$acceptedStream ordinary_s1_always_ready=1")
+
       // Shared nonzero component goldens are expanded to all sixteen masks by
       // the separately frozen Python hash contract. Actual RTL histories are
       // seeded through normal events; no private register forcing is used.
@@ -449,6 +612,126 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       }
       println(s"HINT_CONTINUOUS_ALL_MASK_GOLDEN_PASS vectors=${allMasks.size} masks=16 nonzero_history=1")
       println(s"HINT_CONTINUOUS_ACTUAL_RTL_PASS checks=$checks forced_state=0")
+      // All children share the top reset. Leaf testing resets an inactive Hint,
+      // just as the real loader holds enabled/profile low through SRAM clear.
+      m.io.enabled.poke(false.B);m.io.profile.poke(false.B);m.io.load.valid.poke(false.B)
+      m.io.s1Fire.poke(false.B);m.io.s2Fire.poke(false.B);m.io.s3Fire.poke(false.B)
+
+      }
+      {
+        val m=new { val io=top.io.context;val clock=top.clock;val reset=top.reset }
+      var portChecks=0
+      def tick():Unit={
+        // Both logical operations must be excluded at the public hardware ports.
+        val readFire=m.io.read.valid.peek().litToBoolean && m.io.read.ready.peek().litToBoolean
+        val loadFire=m.io.load.valid.peek().litToBoolean && m.io.load.ready.peek().litToBoolean
+        val writeFire=m.io.writeConf.valid.peek().litToBoolean && m.io.writeConf.ready.peek().litToBoolean
+        assert(!(readFire && (loadFire || writeFire)),"Context logical read/write conflict")
+        assert(!(loadFire && writeFire),"loader and dynamic conf write conflict")
+        portChecks+=1;m.clock.step()
+      }
+      def ready():Unit={
+        var waited=0
+        while(!m.io.resetDone.peek().litToBoolean && waited<20000){tick();waited+=1}
+        assert(m.io.resetDone.peek().litToBoolean,"Context macro reset never completes")
+      }
+      def row(set:Int,way:Int,conf:Int):BigInt=
+        (BigInt(1)<<24)|(BigInt(conf)<<22)|(BigInt((set*3+way)&31)<<17)|BigInt(0x100+set*2+way)
+      var expected=Vector.tabulate(8,2)((set,way)=>row(set,way,(set+way)&3))
+      m.io.clear.poke(false.B);m.io.read.valid.poke(false.B);m.io.read.bits.poke(0.U)
+      m.io.load.valid.poke(false.B);m.io.load.bits.index.poke(0.U);m.io.load.bits.data.poke(0.U)
+      m.io.writeConf.valid.poke(false.B);m.io.writeConf.bits.index.poke(0.U);m.io.writeConf.bits.conf.poke(0.U)
+      m.reset.poke(true.B);m.clock.step(3);m.reset.poke(false.B)
+      // The conf macro finishes much earlier than meta. A pending paired load
+      // must not be half-accepted in that interval.
+      m.io.load.bits.index.poke(15.U);m.io.load.bits.data.poke(expected(7)(1).U)
+      m.io.load.valid.poke(true.B)
+      var resetCycles=0
+      while(!m.io.resetDone.peek().litToBoolean && resetCycles<20000){
+        m.io.load.ready.expect(false.B);m.io.read.ready.expect(false.B)
+        m.io.writeConf.ready.expect(false.B);tick();resetCycles+=1
+      }
+      assert(m.io.resetDone.peek().litToBoolean,"paired SRAM reset timeout")
+      m.io.load.ready.expect(true.B);tick();m.io.load.valid.poke(false.B)
+      def load(index:Int,data:BigInt):Unit={
+        m.io.load.bits.index.poke(index.U);m.io.load.bits.data.poke(data.U)
+        m.io.load.valid.poke(true.B);m.io.load.ready.expect(true.B);tick();m.io.load.valid.poke(false.B)
+      }
+      for(set<-0 until 8;way<-0 until 2)load(set*2+way,expected(set)(way))
+      def read(set:Int):Unit={
+        m.io.read.bits.poke(set.U);m.io.read.valid.poke(true.B);m.io.read.ready.expect(true.B)
+        tick();m.io.respValid.expect(true.B);m.io.readSet.expect(set.U)
+        for(way<-0 until 2)m.io.rows(way).expect(expected(set)(way).U)
+      }
+      // All eight logical sets occupy one folded physical row.
+      for(set<-0 until 8)read(set)
+      m.io.writeConf.bits.index.poke(0.U);m.io.writeConf.bits.conf.poke(3.U)
+      m.io.writeConf.valid.poke(true.B)
+      for(set<-0 until 8){
+        m.io.read.bits.poke(set.U);m.io.read.valid.poke(true.B)
+        m.io.read.ready.expect(true.B);m.io.writeConf.ready.expect(false.B)
+        tick();m.io.respValid.expect(true.B);m.io.readSet.expect(set.U)
+        for(way<-0 until 2)m.io.rows(way).expect(expected(set)(way).U)
+      }
+      m.io.read.valid.poke(false.B);m.io.writeConf.ready.expect(true.B)
+      tick();m.io.writeConf.valid.poke(false.B)
+      expected=expected.updated(0,expected(0).updated(0,(expected(0)(0) & (~(BigInt(3)<<22)))|(BigInt(3)<<22)))
+      for(set<-0 until 8)read(set)
+      // Update/undo each neighbor and each way independently; meta is immutable.
+      for(set<-0 until 8;way<-0 until 2){
+        m.io.read.valid.poke(false.B)
+        val previous=expected(set)(way);val value=((set*3+way+2)&3)
+        m.io.writeConf.bits.index.poke((set*2+way).U);m.io.writeConf.bits.conf.poke(value.U)
+        m.io.writeConf.valid.poke(true.B);m.io.writeConf.ready.expect(true.B);tick();m.io.writeConf.valid.poke(false.B)
+        expected=expected.updated(set,expected(set).updated(way,(previous & (~(BigInt(3)<<22)))|(BigInt(value)<<22)))
+        for(neighbor<-0 until 8)read(neighbor)
+        m.io.read.valid.poke(false.B)
+        m.io.writeConf.bits.conf.poke(((previous>>22)&3).U);m.io.writeConf.valid.poke(true.B)
+        m.io.writeConf.ready.expect(true.B);tick();m.io.writeConf.valid.poke(false.B)
+        expected=expected.updated(set,expected(set).updated(way,previous))
+        for(neighbor<-0 until 8)read(neighbor)
+      }
+      // An invalid response carries old held bits but must never claim a query.
+      m.io.read.valid.poke(false.B);tick();m.io.respValid.expect(false.B)
+      for(way<-0 until 2)m.io.rows(way).expect(expected(7)(way).U)
+      for(clearRound<-0 until 2){
+        m.io.clear.poke(true.B);m.io.read.valid.poke(true.B);m.io.read.bits.poke(7.U)
+        m.io.writeConf.valid.poke(true.B)
+        m.io.read.ready.expect(false.B);m.io.writeConf.ready.expect(false.B)
+        tick();m.io.respValid.expect(false.B)
+        m.io.clear.poke(false.B);m.io.read.valid.poke(false.B);m.io.writeConf.valid.poke(false.B)
+        ready();expected=Vector.fill(8)(Vector.fill(2)(BigInt(0)))
+        for(set<-0 until 8)read(set)
+        m.io.read.valid.poke(false.B)
+      }
+      println(s"HINT_SRAM_CONTEXT_PORTS_PASS checks=$portChecks folded_neighbor_masks=16 true_read_priority=1 paired_reset=1")
+      }
+      {
+        val m=new { val io=top.io.slot;val clock=top.clock;val reset=top.reset }
+      m.io.clear.poke(false.B);m.io.read.valid.poke(false.B);m.io.read.bits.poke(0.U)
+      m.io.load.valid.poke(false.B);m.io.load.bits.index.poke(0.U);m.io.load.bits.data.poke(0.U)
+      m.reset.poke(true.B);m.clock.step(3);m.reset.poke(false.B)
+      def ready():Unit={var n=0;while(!m.io.resetDone.peek().litToBoolean && n<20000){m.clock.step();n+=1};assert(m.io.resetDone.peek().litToBoolean)}
+      ready()
+      val targets=Vector.tabulate(32)(i=>(BigInt(1)<<46)|BigInt(0x1000+i*8))
+      for(index<-0 until 32){
+        m.io.load.bits.index.poke(index.U);m.io.load.bits.data.poke(targets(index).U)
+        m.io.load.valid.poke(true.B);m.io.load.ready.expect(true.B);m.clock.step();m.io.load.valid.poke(false.B)
+      }
+      for(index<-Seq(0,31,1,30,0,7,8,16,31)){
+        m.io.read.bits.poke(index.U);m.io.read.valid.poke(true.B);m.io.read.ready.expect(true.B)
+        m.io.load.bits.index.poke(31.U);m.io.load.bits.data.poke(0x1234.U);m.io.load.valid.poke(true.B)
+        m.io.load.ready.expect(false.B);m.clock.step()
+        m.io.respValid.expect(true.B);m.io.readSlot.expect(index.U);m.io.target.expect(targets(index).U)
+      }
+      m.io.read.valid.poke(false.B);m.io.load.valid.poke(false.B)
+      m.clock.step(3);m.io.respValid.expect(false.B);m.io.target.expect(targets(31).U)
+      m.io.clear.poke(true.B);m.io.read.valid.poke(true.B)
+      m.io.read.ready.expect(false.B);m.clock.step();m.io.respValid.expect(false.B)
+      m.io.clear.poke(false.B);m.io.read.valid.poke(false.B);ready()
+      for(index<-0 until 32){m.io.read.bits.poke(index.U);m.io.read.valid.poke(true.B);m.clock.step();m.io.readSlot.expect(index.U);m.io.target.expect(0.U)}
+      println("HINT_SRAM_SLOT_PORTS_PASS width47=1 synchronous_identity=1 held_bits_invalid=1 cleared_all32=1")
+      }
     }
   }
 }

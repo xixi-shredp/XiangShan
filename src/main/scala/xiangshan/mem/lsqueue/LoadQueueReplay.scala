@@ -959,6 +959,24 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   val perfValidCount = RegNext(PopCount(allocated))
 
   //  perf cnt
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    io.enq.zipWithIndex.foreach { case (port,lane) =>
+      val u = port.bits.uop
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,24,lane,port.fire,
+        Seq(u.robIdx.asUInt,u.ftqPtr.asUInt,u.ftqOffset,u.pc,u.lqIdx.asUInt,
+          u.debug_seqNum.asUInt,port.bits.vaddr,port.bits.rep_info.cause.asUInt,
+          port.bits.rep_info.need_rep.asUInt,cancelEnq(lane).asUInt))
+    }
+    replay_req.zipWithIndex.foreach { case (port,lane) =>
+      val u = port.bits.uop
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,25,lane,port.fire,
+        Seq(u.robIdx.asUInt,u.ftqPtr.asUInt,u.ftqOffset,u.pc,u.lqIdx.asUInt,
+          u.debug_seqNum.asUInt,port.bits.vaddr,port.bits.cause.get.asUInt,
+          port.bits.mshrId.get,port.bits.replayQueueIdx.get))
+    }
+  }
+
   val enqNumber               = PopCount(io.enq.map(enq => enq.fire && !enq.bits.isLoadReplay))
   val deqNumber               = PopCount(io.replay.map(_.fire))
   val deqBlockCount           = PopCount(io.replay.map(r => r.valid && !r.ready))

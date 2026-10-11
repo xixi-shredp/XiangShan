@@ -299,6 +299,33 @@ class MainBtbAlignBank(
     b.io.flush.req.bits.wayMask := s2_multiHitMask
   }
 
+  // Simulation-only bank operands and actual SRAM port fingerprints.
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    xiangshan.DiagnosticDpi.emit(clock, reset, dc, 28, alignIdx, t1_fire,
+      Seq(t1_startPc.toUInt, t1_setIdx, t1_internalBankIdx,
+        t1_needWrite.asUInt, t1_mispredictInfo.valid.asUInt,
+        t1_mispredictInfo.bits.cfiPosition, t1_mispredictInfo.bits.target.toUInt,
+        t1_mispredictInfo.bits.attribute.asUInt, t1_hitMask, t1_victimMask,
+        t1_entryNeedWrite.asUInt, t1_entryWayMask, t1_entry.tag, t1_entry.position,
+        t1_entry.targetLowerBits, VecInit(t1_branches.map(b => b.valid && b.bits.mispredict)).asUInt))
+    t1_meta.zipWithIndex.foreach { case (m, way) =>
+      xiangshan.DiagnosticDpi.emit(clock, reset, dc, 29, alignIdx * NumWay + way, t1_fire,
+        Seq(t1_startPc.toUInt, t1_setIdx, t1_internalBankIdx,
+          m.rawHit.asUInt, m.position, m.attribute.asUInt,
+          m.hit(t1_mispredictInfo.bits).asUInt, t1_mispredictInfo.valid.asUInt,
+          t1_mispredictInfo.bits.cfiPosition, m.counter.asUInt,
+          t1_counterWayMask(way).asUInt, t1_newCounters(way).asUInt))
+    }
+    s2_rawEntries.zipWithIndex.foreach { case (entry, way) =>
+      xiangshan.DiagnosticDpi.emit(clock, reset, dc, 31, alignIdx * NumWay + way, s2_fire,
+        Seq(s2_startPc.toUInt, s2_setIdx, getInternalBankIndex(s2_startPc),
+          entry.tag, entry.position, entry.attribute.asUInt, entry.targetLowerBits,
+          r.resp.predictions(way).valid.asUInt, r.resp.metas(way).rawHit.asUInt,
+          r.resp.metas(way).position, s2_rawCounters(way).asUInt, s2_multiHitMask,
+          0.U))
+    }
+  }
   // mainBTB trace bundle
   io.trace.needWrite := t1_fire && t1_entryNeedWrite
   io.trace.setIdx    := t1_setIdx

@@ -161,6 +161,17 @@ class MainBtb(implicit p: Parameters) extends BasePredictor with HasMainBtbParam
     // see comments in MainBtbAlignBank.scala
     b.io.write.req.bits.mispredictInfo := t1_mispredictInfo
   }
+  // Simulation-only actual training operand; no return/control signals.
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    xiangshan.DiagnosticDpi.emit(clock, reset, dc, 27, 0, t1_fire,
+      Seq(t1_train.startPc.toUInt, t1_mispredictInfo.valid.asUInt,
+        t1_mispredictInfo.bits.cfiPosition, t1_mispredictInfo.bits.target.toUInt,
+        t1_mispredictInfo.bits.attribute.asUInt, t1_mispredictInfo.bits.taken.asUInt,
+        VecInit(t1_train.branches.map(_.valid)).asUInt,
+        VecInit(t1_train.branches.map(b => b.valid && b.bits.mispredict)).asUInt,
+        t1_writeAlignBankIdx, t1_writeAlignBankMask.asUInt))
+  }
   /* --------------------------------------------------------------------------------------------------------------
      MainBTB Trace
      -------------------------------------------------------------------------------------------------------------- */

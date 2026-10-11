@@ -383,6 +383,26 @@ class CtrlBlockImp(
   }
   redirectGen.io.loadReplay.bits.pc := loadRedirectStartPcRead + loadRedirectPcOffset
 
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    val r = redirectGen.io.loadReplay
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,13,0,r.valid,
+      Seq(r.bits.ftqIdx.asUInt,r.bits.ftqOffset,r.bits.isRVC.asUInt,
+        r.bits.robIdx.asUInt,r.bits.level.asUInt,r.bits.pc,r.bits.target,
+        loadRedirectStartPcRead,loadRedirectPcOffset,loadRedirectTargetOffset,
+        r.bits.flushItself().asUInt))
+  }
+
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    Seq(oldestExuRedirect,s1_robFlushRedirect,s3_redirectGen).zipWithIndex.foreach { case (r,lane) =>
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,17,lane,r.valid,
+        Seq(r.bits.ftqIdx.asUInt,r.bits.ftqOffset,r.bits.isRVC.asUInt,
+          r.bits.robIdx.asUInt,r.bits.level.asUInt,r.bits.pc,r.bits.target,
+          Cat(r.bits.debugIsMemVio,r.bits.debugIsCtrl,r.bits.isMisPred,r.bits.flushItself())))
+    }
+  }
+
   redirectGen.io.robFlush := s1_robFlushRedirect
 
   val s4_flushFromRobValidAhead = DelayN(s1_robFlushRedirect.valid, 3)
@@ -429,6 +449,12 @@ class CtrlBlockImp(
       lanes(i).bits.instr := rob.io.commits.info(i).debug_instr.get
       lanes(i).bits.isRVC := rob.io.commits.info(i).isRVC
       lanes(i).bits.ordinal := rob.io.debugRetiredBase.get + committedSizes.reduce(_ +& _)
+      val dc = xiangshan.DiagnosticDpi.cycle()
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,14,i,lanes(i).valid,
+        Seq(lanes(i).bits.ftqPtr.asUInt,lanes(i).bits.ftqOffset,lanes(i).bits.pc,
+          lanes(i).bits.instr,lanes(i).bits.isRVC.asUInt,lanes(i).bits.ordinal,
+          rob.io.debugRetiredSizes.get(i),rob.io.debugRetiredBase.get,
+          0.U))
       when(lanes(i).valid && BranchAttribute.decode(lanes(i).bits.instr, true.B).needIttage &&
         !rawLocationReported) {
         rawLocationReported := true.B

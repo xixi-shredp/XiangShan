@@ -59,6 +59,7 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
     val fromFtq:     FtqToBpuIO = Flipped(new FtqToBpuIO)
     val toFtq:       BpuToFtqIO = new BpuToFtqIO
     val hintLoad = Flipped(Decoupled(new HintLoadCmd))
+    val hintTableReady = Output(Bool())
     val hintEnabled = Input(Bool())
     val hintProfile = Input(Bool())
     val hintMeasureActive = Input(Bool())
@@ -85,6 +86,7 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   private val hint        = Module(new Hint)
 
   hint.io.load <> io.hintLoad
+  io.hintTableReady := hint.io.tableReady
   hint.io.enabled := io.hintEnabled
   hint.io.profile := io.hintProfile
   hint.io.measureActive := io.hintMeasureActive
@@ -159,6 +161,7 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   private val s3_valid = RegInit(false.B)
 
   private val s3_override = WireDefault(false.B)
+  private val diagnosticOverrideReason = Option.when(!env.FPGAPlatform)(WireDefault(0.U(4.W)))
 
   private val s1_prediction = Wire(new Prediction)
   private val s3_prediction = Wire(new Prediction)
@@ -502,6 +505,7 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
         )
       )
 
+    diagnosticOverrideReason.foreach(_ := Cat(targetDiff, attributeDiff, cfiPositionDiff, takenDiff))
     s3_valid && (takenDiff || cfiPositionDiff || attributeDiff || targetDiff)
   }
 
@@ -792,6 +796,47 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
       ("fallThrough", !s1_taken)
     )
   )
+  if (!env.FPGAPlatform) {
+    val dc = hintQueryCycle.get
+    val q2 = RegEnable(dc, s1_fire)
+    val q3 = RegEnable(q2, s2_fire)
+    def u(x: Data): UInt = x.asUInt
+    def pred(kind: Int, lane: Int, fire: Bool, query: UInt, ptr: UInt, start: UInt,
+        prediction: Prediction, valid: Bool, taken: Bool, source: UInt, reason: UInt): Unit = {
+      xiangshan.DiagnosticDpi.emit(clock, reset, dc, kind, lane, fire,
+        Seq(query, ptr, start, prediction.cfiPosition.asUInt,
+          prediction.target.toUInt, prediction.attribute.asUInt, valid.asUInt,
+          taken.asUInt, source, reason,
+          getCfiPcFromPosition(GuardedPcInit(start),prediction.cfiPosition).toUInt,
+          0.U))
+    }
+    pred(1, 0, s1_fire, dc, io.fromFtq.bpuPtr.asUInt, s1_startPc.get.toUInt,
+      s1_prediction, true.B, s1_taken, s1_predictionSource.asUInt, 0.U)
+    for (i <- 0 until NumAheadBtbPredictionEntries) {
+      pred(2, i, s1_fire, dc, io.fromFtq.bpuPtr.asUInt, s1_startPc.get.toUInt,
+        s1_abtbPrediction(i), abtb.io.prediction(i).valid, s1_abtbTakenMask(i),
+        Cat(s1_utageHitMask(i), s1_utageTakenMask(i), s1_jumpValidVec(i),
+          s1_conditonalValidVec(i), s1_abtbFirstTakenBrOH(i)), 0.U)
+    }
+    pred(3, 0, s1_fire, dc, io.fromFtq.bpuPtr.asUInt, s1_startPc.get.toUInt,
+      s1_ubtbPrediction, ubtb.io.prediction.valid, s1_ubtbPrediction.taken, 0.U, 0.U)
+    val reason = diagnosticOverrideReason.get
+    pred(4, 0, s3_fire, q3, s3_ftqPtr.asUInt, s3_startPc.get.toUInt,
+      s3_prediction, s3_valid, s3_taken,
+      Cat(s3_useHint, s3_useIttage, s3_useRas, s3_override), reason)
+    pred(5, 0, s3_fire, q3, s3_ftqPtr.asUInt, s3_startPc.get.toUInt,
+      s3_s1Prediction, s3_valid, s3_s1Prediction.taken, 0.U, 0.U)
+    for (i <- s3_mbtbResult.indices) {
+      pred(6, i, s3_fire, q3, s3_ftqPtr.asUInt, s3_startPc.get.toUInt,
+        s3_mbtbResult(i).bits, s3_mbtbResult(i).valid, s3_takenMask(i),
+        Cat(s3_firstTakenBranchOH(i), s3_tagePrediction.takenVec(i).valid,
+          s3_tagePrediction.takenVec(i).bits, s3_scUsed(i), s3_scTakenMask(i)), 0.U)
+    }
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,7,0,s3_fire,
+      Seq(q3,s3_ftqPtr.asUInt,s3_baselineTarget.toUInt,fastTrain.valid.asUInt,
+        fastTrain.bits.branch.taken.asUInt))
+  }
+
   XSPerfAccumulate("s3_use_ras", s3_fire && s3_taken && s3_useRas)
   XSPerfAccumulate("s3_use_ittage", s3_fire && s3_taken && !s3_useRas && s3_useIttage)
   XSPerfAccumulate("s3_use_mbtb_tage", s3_fire && s3_prediction.attribute.isConditional)

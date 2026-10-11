@@ -9,6 +9,7 @@ class HintDpi extends BlackBox with HasBlackBoxInline {
     val clock = Input(Clock())
     val reset = Input(Bool())
     val loadReady = Input(Bool())
+    val tableReady = Input(Bool())
     val loadValid = Output(Bool())
     val loadKind = Output(UInt(2.W))
     val loadIndex = Output(UInt(12.W))
@@ -24,6 +25,7 @@ module HintDpi (
   input  logic        clock,
   input  logic        reset,
   input  logic        loadReady,
+  input  logic        tableReady,
   output logic        loadValid,
   output logic [1:0]  loadKind,
   output logic [11:0] loadIndex,
@@ -56,6 +58,7 @@ module HintDpi (
 );
   import "DPI-C" context function void h2p_hint_tick(
     input bit reset,
+    input bit tableReady,
     input int unsigned camMiss, contextMiss, confZero, overrides,
     input int unsigned metaStall, lhrStall, confUp, confDown, confDropped,
     output bit valid, output byte unsigned kind,
@@ -80,7 +83,7 @@ module HintDpi (
   always @(posedge clock) h2p_hint_ack(reset, loadValid, loadReady);
   always @(negedge clock) begin
     h2p_hint_extended_stats(stats_lookupPortFallback, stats_metadataFallback, stats_rollbackFallback, stats_clearingFallback, stats_s3Confirmed, stats_recordAllocate, stats_lhrWrites, stats_confFullWait, stats_confApply, stats_confUndo, stats_confAccepted, stats_confCanceled, stats_confRetired);
-    h2p_hint_tick(reset, stats_camMiss, stats_contextMiss, stats_confZero,
+    h2p_hint_tick(reset, tableReady, stats_camMiss, stats_contextMiss, stats_confZero,
                   stats_overrides, stats_metaStall, stats_lhrStall,
                   stats_confUp, stats_confDown, stats_confDropped,
                   loadValid, dpiKind,

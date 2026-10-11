@@ -100,6 +100,7 @@ class HintProfileRecord(implicit p: Parameters) extends Bundle {
   val live = Bool()
   val cutoffValid = Bool()
   val cutoffWord = UInt(47.W)
+  val cutoffInclusive = Bool()
   val resolved = Bool()
   val event = new HintProfileEvent
   // Observer-only restore window. It prevents baseline profiling from needing
@@ -184,6 +185,9 @@ class HintConfReq(implicit p: Parameters) extends Bundle {
 class Hint(implicit p: Parameters) extends BpuModule {
   class HintIO extends Bundle {
     val load = Flipped(Decoupled(new HintLoadCmd))
+    // Offline readiness only. The DPI loader latches completion; transient
+    // execution/rollback pressure must never toggle its running mode.
+    val tableReady = Output(Bool())
     // The simulation wrapper raises this only after clearing and loading an image.
     val enabled = Input(Bool())
     val profile = Input(Bool())
@@ -226,11 +230,14 @@ class Hint(implicit p: Parameters) extends BpuModule {
   val io = IO(new HintIO)
 
   private val cam = RegInit(VecInit(Seq.fill(16)(0.U(52.W))))
-  private val slots = RegInit(VecInit(Seq.fill(32)(0.U(47.W))))
-  // A single Context access (two ways of one set) is admitted each cycle.
-  private val context = Reg(Vec(4096, UInt(25.W)))
+  private val contextTable = Module(new HintContextTable)
+  private val slotTable = Module(new HintSlotTable)
   private val clearing = RegInit(true.B)
-  private val clearIndex = RegInit(0.U(12.W))
+  // Decode Clear acceptance without feeding io.load.ready back through the
+  // leaf clear input. Other load kinds use leaf ready, which depends on clear.
+  private val clearFire = WireDefault(false.B)
+  contextTable.io.clear := clearFire
+  slotTable.io.clear := clearFire
 
   private val ith = RegInit(VecInit(Seq.fill(128)(0.U(2.W))))
   private val calls = RegInit(VecInit(Seq.fill(128)(0.U(2.W))))
@@ -262,6 +269,7 @@ class Hint(implicit p: Parameters) extends BpuModule {
   private val rollback = RegInit(false.B)
   private val rollbackBoundary = Reg(new FtqPtr)
   private val rollbackCutoffWord = Reg(UInt(47.W))
+  private val rollbackCutoffInclusive = Reg(Bool())
   private val rollbackKillWhole = Reg(Bool())
   private val confDropped = RegInit(0.U(32.W))
   io.confDropped := confDropped
@@ -337,13 +345,14 @@ class Hint(implicit p: Parameters) extends BpuModule {
 
   // Ordinary S1 is independent of Hint capacity and table maintenance.
   val metaFull = (metaTail - metaHead) === 16.U
-  val pendingWrite = confWrite =/= confTail
+  val confFull = (confTail - confHead) === 32.U
   val tableBusy = clearing || rollback || io.redirect.valid ||
-    (io.load.valid && io.load.bits.kind === 2.U) || pendingWrite
+    io.load.valid || metaFull || confFull
   io.canAccept := true.B
   io.debugLhrFull.foreach(_ := false.B)
   io.debugMetaFull.foreach(_ := metaFull)
-  val lookupFire = io.s1Fire && candidate && !tableBusy
+  contextTable.io.read.valid := io.s1Fire && candidate && !tableBusy
+  val lookupFire = contextTable.io.read.fire
 
   val ithLow64 = ringLow(ith, ithHead, 32, 7)
   val callLow64 = ringLow(calls, callHead, 32, 7)
@@ -360,22 +369,41 @@ class Hint(implicit p: Parameters) extends BpuModule {
     Mux(candidateMask(3), rol28(retComponent, 5), 0.U(28.W))
   val set = key(10, 0)
   val tag = key(27, 11)
-  val readContext = lookupFire
+  contextTable.io.read.bits := set
   val writeBroadcast = WireDefault(false.B)
   val broadcastSetway = WireDefault(0.U(12.W))
   val broadcastConf = WireDefault(0.U(2.W))
   def mergeConf(row: UInt, setway: UInt): UInt =
     Mux(writeBroadcast && broadcastSetway === setway,
       Cat(row(24), broadcastConf, row(21, 0)), row)
-  val s2Row0 = RegEnable(context(Cat(set, 0.U(1.W))), lookupFire)
-  val s2Row1 = RegEnable(context(Cat(set, 1.U(1.W))), lookupFire)
-  val s2ReadValid = RegEnable(lookupFire, io.s1Fire)
-  val s3ReadValid = RegEnable(s2ReadValid, io.s2Fire)
+  val s2ReadValid = RegEnable(lookupFire, false.B, io.s1Fire)
+  val s3ReadValid = RegInit(false.B)
+  val s3SlotValid = RegInit(false.B)
+  when(io.s2Fire && !io.s1Fire) { s2ReadValid := false.B }
+  when(io.redirect.valid || io.s3Override || clearFire) { s2ReadValid := false.B }
+  when(io.s3Fire && !io.s2Fire) { s3ReadValid := false.B; s3SlotValid := false.B }
+  when(io.redirect.valid || clearFire) { s3ReadValid := false.B; s3SlotValid := false.B }
   val s2Candidate = RegEnable(candidate, io.s1Fire)
   val s2Pc = RegEnable(candidatePc, io.s1Fire)
   val s2CamIndex = RegEnable(camIndex, io.s1Fire)
   val s2Set = RegEnable(set, io.s1Fire)
   val s2Tag = RegEnable(tag, io.s1Fire)
+  // Fresh synchronous data is used in S2 immediately. Only the two tiny
+  // confidence fields need an independently writable hold cache for broadcast.
+  val s2ConfCache = Reg(Vec(2, UInt(2.W)))
+  val s2Rows = Wire(Vec(2, UInt(25.W)))
+  for (way <- 0 until 2) {
+    val raw = contextTable.io.rows(way)
+    val conf = Mux(contextTable.io.respValid, raw(23, 22), s2ConfCache(way))
+    val row = Cat(raw(24), conf, raw(21, 0))
+    s2Rows(way) := mergeConf(row, Cat(s2Set, way.U(1.W)))
+    when(contextTable.io.respValid || (writeBroadcast && broadcastSetway === Cat(s2Set, way.U(1.W)))) {
+      s2ConfCache(way) := s2Rows(way)(23, 22)
+    }
+  }
+  when(contextTable.io.respValid && s2ReadValid && !io.redirect.valid) {
+    assert(contextTable.io.readSet === s2Set)
+  }
   val s2Components = RegEnable(VecInit(Seq(ithComponent, lhrComponent, callComponent, retComponent)), io.s1Fire)
   val s3Components = RegEnable(s2Components, io.s2Fire)
   val s2Mask = RegEnable(candidateMask, io.s1Fire)
@@ -386,19 +414,34 @@ class Hint(implicit p: Parameters) extends BpuModule {
   queryClock := queryClock + 1.U
   val s2QueryCycle = RegEnable(queryClock, io.s1Fire)
   val s3QueryCycle = RegEnable(s2QueryCycle, io.s2Fire)
-  val s3Row0 = RegEnable(mergeConf(s2Row0, Cat(s2Set, 0.U(1.W))), io.s2Fire)
-  val s3Row1 = RegEnable(mergeConf(s2Row1, Cat(s2Set, 1.U(1.W))), io.s2Fire)
   val s3Candidate = RegEnable(s2Candidate, io.s2Fire)
   val s3Pc = RegEnable(s2Pc, io.s2Fire)
   val s3CamIndex = RegEnable(s2CamIndex, io.s2Fire)
   val s3Set = RegEnable(s2Set, io.s2Fire)
-  val s3Tag = RegEnable(s2Tag, io.s2Fire)
-  val way0Hit = s3Row0(24) && s3Row0(16, 0) === s3Tag
-  val way1Hit = s3Row1(24) && s3Row1(16, 0) === s3Tag
-  val contextHit = io.enabled && s3ReadValid && s3Candidate && (way0Hit || way1Hit)
-  val selectedWay = !way0Hit && way1Hit
-  val selectedRow = Mux(selectedWay, s3Row1, s3Row0)
+  val s2Way0Hit = s2Rows(0)(24) && s2Rows(0)(16, 0) === s2Tag
+  val s2Way1Hit = s2Rows(1)(24) && s2Rows(1)(16, 0) === s2Tag
+  val s2SelectedWay = !s2Way0Hit && s2Way1Hit
+  val s2SelectedRow = Mux(s2SelectedWay, s2Rows(1), s2Rows(0))
+  slotTable.io.read.valid := io.s2Fire && s2ReadValid && s2Candidate &&
+    (s2Way0Hit || s2Way1Hit) && !clearing && !clearFire && !io.redirect.valid && !io.s3Override
+  slotTable.io.read.bits := s2SelectedRow(21, 17)
+  when(io.s2Fire) {
+    s3ReadValid := s2ReadValid && !io.redirect.valid && !io.s3Override && !clearFire
+    s3SlotValid := slotTable.io.read.fire
+  }
+  val selectedWay = RegEnable(s2SelectedWay, io.s2Fire)
+  val selectedSlot = RegEnable(s2SelectedRow(21, 17), io.s2Fire)
+  val selectedRawConf = RegEnable(s2SelectedRow(23, 22), io.s2Fire)
   val selectedSetway = Cat(s3Set, selectedWay)
+  when(writeBroadcast && !io.s2Fire && broadcastSetway === selectedSetway) {
+    selectedRawConf := broadcastConf
+  }
+  when(slotTable.io.respValid && s3SlotValid && !io.redirect.valid) {
+    assert(slotTable.io.readSlot === selectedSlot)
+  }
+  val contextHit = io.enabled && s3ReadValid && s3SlotValid && s3Candidate
+  val targetHold = RegEnable(slotTable.io.target, slotTable.io.respValid)
+  val selectedTarget = Mux(slotTable.io.respValid, slotTable.io.target, targetHold)
 
   // Forward every unapplied or applied, uncommitted confidence update in FTQ age order.
   private def forwardedConf(setway: UInt, raw: UInt): UInt = {
@@ -414,7 +457,7 @@ class Hint(implicit p: Parameters) extends BpuModule {
   // Current apply writes remain in confLog, including a concurrently retiring
   // head. Earlier retired writes are already broadcast into cached rows. Do
   // not depend on current write arbitration here: it includes S3 override.
-  val selectedConf = forwardedConf(selectedSetway, selectedRow(23, 22))
+  val selectedConf = forwardedConf(selectedSetway, selectedRawConf)
   io.debugSelectedConf.foreach(_ := selectedConf)
   when(io.enabled && io.s3Fire && s3Candidate && !contextHit) {
     contextMisses := contextMisses + 1.U
@@ -426,13 +469,13 @@ class Hint(implicit p: Parameters) extends BpuModule {
   io.s3Lookup.pc := s3Pc
   io.s3Lookup.camIndex := s3CamIndex
   io.s3Lookup.contextHit := contextHit
-  io.s3Lookup.usable := contextHit && selectedConf =/= 0.U && !metaFull &&
+  io.s3Lookup.usable := contextHit && selectedConf =/= 0.U && !metaFull && !confFull &&
     !clearing && !rollback && !io.redirect.valid && io.s3Prediction.taken &&
     io.s3Prediction.attribute.needIttage && !io.s3Prediction.attribute.isReturn &&
     io.s3CfiPc === s3Pc
   io.s3Lookup.set := s3Set
   io.s3Lookup.way := selectedWay
-  io.s3Lookup.target := canonical(slots(selectedRow(21, 17)))
+  io.s3Lookup.target := canonical(selectedTarget)
 
   val s1Exact = VecInit((0 until 16).map(i => cam(i)(51) && canonical(cam(i)(46, 0)) === io.s1CfiPc))
   val s1ExactIndex = PriorityEncoder(s1Exact)
@@ -444,13 +487,70 @@ class Hint(implicit p: Parameters) extends BpuModule {
     overrideCount := overrideCount + 1.U
   }
 
+  // The v4 trace observes actual pipeline data without feeding any predictor control.
+  // S1 owns the pre-update components; S3 uses the saved S1 query cycle.
+  if (!env.FPGAPlatform) {
+    val traceStartS2 = RegEnable(io.s1StartPc, io.s1Fire)
+    val traceStartS3 = RegEnable(traceStartS2, io.s2Fire)
+    for (stage <- 0 until 2) {
+      val observer = Module(new HintQueryV4Dpi)
+      observer.io.clock := clock
+      observer.io.stage := stage.U
+      if (stage == 0) {
+        observer.io.valid := !reset.asBool && io.profile && io.s1Fire
+        observer.io.ftqTag := io.s1Ptr.asUInt
+        observer.io.queryCycle := queryClock
+        observer.io.startPc := io.s1StartPc
+        observer.io.candidatePc := candidatePc
+        observer.io.pcId := camIndex
+        observer.io.candidate := candidate
+        observer.io.lookupFire := lookupFire
+        observer.io.s3Eligible := false.B
+        observer.io.admission := !tableBusy
+        observer.io.ith := ithComponent
+        observer.io.lhr := lhrComponent
+        observer.io.call := callComponent
+        observer.io.ret := retComponent
+      } else {
+        observer.io.valid := !reset.asBool && io.profile && io.s3Fire
+        observer.io.ftqTag := io.s3Ptr.asUInt
+        observer.io.queryCycle := s3QueryCycle
+        observer.io.startPc := traceStartS3
+        observer.io.candidatePc := s3Pc
+        observer.io.pcId := s3CamIndex
+        observer.io.candidate := s3Candidate
+        observer.io.lookupFire := s3ReadValid
+        observer.io.s3Eligible := s3HintEvent
+        observer.io.admission := !metaFull && !clearing && !rollback && !io.redirect.valid
+        observer.io.ith := s3Components(0)
+        observer.io.lhr := s3Components(1)
+        observer.io.call := s3Components(2)
+        observer.io.ret := s3Components(3)
+      }
+    }
+  }
+
   // The observer retains one committed branch event per FTQ entry. It has no
   // path into io.canAccept or the prediction mux and is inert outside profile.
   val backendBoundary = Mux(io.redirect.bits.reapply,
     io.redirect.bits.newFtqIdx - 1.U, io.redirect.bits.newFtqIdx)
+  def pastCutoff(pcWord: UInt, cutoffWord: UInt, inclusive: Bool): Bool =
+    pcWord > cutoffWord || (inclusive && pcWord === cutoffWord)
+  def profileSurvives(row: HintProfileRecord, pcWord: UInt): Bool =
+    !row.cutoffValid || !pastCutoff(pcWord, row.cutoffWord, row.cutoffInclusive)
+  def mergeProfileCutoff(row: HintProfileRecord, word: UInt, inclusive: Bool): Unit = {
+    row.cutoffValid := true.B
+    when(!row.cutoffValid || word < row.cutoffWord) {
+      row.cutoffWord := word
+      row.cutoffInclusive := inclusive
+    }.elsewhen(word === row.cutoffWord) {
+      row.cutoffInclusive := row.cutoffInclusive || inclusive
+    }
+  }
   def backendKills(ptr: FtqPtr, pcWord: UInt): Bool =
     ptr > backendBoundary || (ptr === backendBoundary &&
-      (!io.redirect.bits.reapply || pcWord > io.redirect.bits.cfiPc.toUInt(47, 1)))
+      (!io.redirect.bits.reapply || pastCutoff(pcWord, io.redirect.bits.cfiPc.toUInt(47, 1),
+         io.redirect.bits.flushItself)))
   def s3Kills(ptr: FtqPtr, pcWord: UInt): Bool =
     ptr > io.s3Ptr || (ptr === io.s3Ptr && io.s3Prediction.taken && pcWord > io.s3CfiPc(47, 1))
   def killedNow(ptr: FtqPtr, pcWord: UInt): Bool =
@@ -486,7 +586,7 @@ class Hint(implicit p: Parameters) extends BpuModule {
     for (resolve <- io.resolve) {
       val row = profileRows(resolve.bits.ftqPtr.value)
       val existingKilled = killedNow(row.ptr, row.event.pc(47, 1))
-      val allowed = row.live && (!row.cutoffValid || resolve.bits.cfiPc(47, 1) <= row.cutoffWord)
+      val allowed = row.live && profileSurvives(row, resolve.bits.cfiPc(47, 1))
       when(resolve.valid && resolve.bits.eligible && resolve.bits.sourceBackend && allowed &&
         row.ptr === resolve.bits.ftqPtr && (!row.resolved || existingKilled) &&
         !killedNow(resolve.bits.ftqPtr, resolve.bits.cfiPc(47, 1))) {
@@ -505,7 +605,7 @@ class Hint(implicit p: Parameters) extends BpuModule {
   val commitRow = profileRows(io.commit.bits.value)
   io.profileEvent.valid := io.profile && io.commit.valid && commitRow.resolved &&
     commitRow.live && commitRow.ptr === io.commit.bits &&
-    (!commitRow.cutoffValid || commitRow.event.pc(47, 1) <= commitRow.cutoffWord) &&
+    profileSurvives(commitRow, commitRow.event.pc(47, 1)) &&
     !killedNow(commitRow.ptr, commitRow.event.pc(47, 1))
   io.profileEvent.bits := commitRow.event
   when(io.profile && io.commit.valid) {
@@ -517,12 +617,10 @@ class Hint(implicit p: Parameters) extends BpuModule {
       val row = profileRows(i)
       when(row.ptr > io.s3Ptr) { row.resolved := false.B; row.live := false.B }
       when(row.ptr === io.s3Ptr && io.s3Prediction.taken) {
-        row.cutoffValid := true.B
-        row.cutoffWord := Mux(row.cutoffValid && row.cutoffWord < io.s3CfiPc(47, 1),
-          row.cutoffWord, io.s3CfiPc(47, 1))
+        mergeProfileCutoff(row, io.s3CfiPc(47, 1), false.B)
         val replacing = io.resolve.map(r => r.valid && r.bits.sourceBackend && r.bits.eligible && row.live &&
           r.bits.ftqPtr === row.ptr && r.bits.cfiPc(47, 1) <= io.s3CfiPc(47, 1) &&
-          (!row.cutoffValid || r.bits.cfiPc(47, 1) <= row.cutoffWord)).reduce(_ || _)
+          profileSurvives(row, r.bits.cfiPc(47, 1))).reduce(_ || _)
         when(row.resolved && row.event.pc(47, 1) > io.s3CfiPc(47, 1) && !replacing) { row.resolved := false.B }
       }
     }
@@ -535,13 +633,13 @@ class Hint(implicit p: Parameters) extends BpuModule {
         row.live := false.B
       }
       when(io.redirect.bits.reapply && row.ptr === backendBoundary) {
-        row.cutoffValid := true.B
-        row.cutoffWord := Mux(row.cutoffValid && row.cutoffWord < io.redirect.bits.cfiPc.toUInt(47, 1),
-          row.cutoffWord, io.redirect.bits.cfiPc.toUInt(47, 1))
+        mergeProfileCutoff(row, io.redirect.bits.cfiPc.toUInt(47, 1), io.redirect.bits.flushItself)
         val replacing = io.resolve.map(r => r.valid && r.bits.sourceBackend && r.bits.eligible &&
-          r.bits.ftqPtr === row.ptr && r.bits.cfiPc(47, 1) <= io.redirect.bits.cfiPc.toUInt(47, 1) &&
-          (!row.cutoffValid || r.bits.cfiPc(47, 1) <= row.cutoffWord)).reduce(_ || _)
-        when(row.resolved && row.event.pc(47, 1) > io.redirect.bits.cfiPc.toUInt(47, 1) && !replacing) {
+          r.bits.ftqPtr === row.ptr && !pastCutoff(r.bits.cfiPc(47, 1),
+            io.redirect.bits.cfiPc.toUInt(47, 1), io.redirect.bits.flushItself) &&
+          profileSurvives(row, r.bits.cfiPc(47, 1))).reduce(_ || _)
+        when(row.resolved && pastCutoff(row.event.pc(47, 1),
+          io.redirect.bits.cfiPc.toUInt(47, 1), io.redirect.bits.flushItself) && !replacing) {
           row.resolved := false.B
         }
       }
@@ -577,7 +675,7 @@ class Hint(implicit p: Parameters) extends BpuModule {
     io.resolve.zipWithIndex.foreach { case (r, i) =>
       val row = profileRows(r.bits.ftqPtr.value)
       val accepted = row.live && row.ptr === r.bits.ftqPtr && r.bits.eligible && r.bits.sourceBackend &&
-        (!row.cutoffValid || r.bits.cfiPc(47, 1) <= row.cutoffWord) &&
+        profileSurvives(row, r.bits.cfiPc(47, 1)) &&
         (!row.resolved || killedNow(row.ptr, row.event.pc(47, 1))) &&
         !killedNow(r.bits.ftqPtr, r.bits.cfiPc(47, 1))
       emit(i + 1, io.profile && r.valid, 1, r.bits.ftqPtr, row.event.queryCycle,
@@ -707,6 +805,7 @@ class Hint(implicit p: Parameters) extends BpuModule {
   when((io.enabled || io.profile) && io.redirect.valid) {
     val redirect = io.redirect.bits
     val reapply = redirect.reapply
+    val applySurvivingCfi = reapply && !redirect.flushItself && redirect.taken
     val exactHit = VecInit((0 until 16).map(i => cam(i)(51) &&
       canonical(cam(i)(46, 0)) === redirect.cfiPc.toUInt)).asUInt
     val profilePtr = Mux(reapply, (redirect.newFtqIdx.value - 1.U)(5, 0),
@@ -715,15 +814,15 @@ class Hint(implicit p: Parameters) extends BpuModule {
       restoreProfileWindow(redirect.meta.hint, profileRows(profilePtr))
     }
     restoreAndApply(redirect.meta.hint, redirect.cfiPc.toUInt, redirect.target.toUInt,
-      reapply && redirect.taken, redirect.attribute.needIttage,
+      applySurvivingCfi, redirect.attribute.needIttage,
       redirect.attribute.hasPush, redirect.attribute.hasPop,
-      exactHit.orR && reapply && redirect.taken && redirect.attribute.needIttage,
+      exactHit.orR && applySurvivingCfi && redirect.attribute.needIttage,
       PriorityEncoder(exactHit))
   }
 
   // The S3 actual CFI owns metadata; no speculative S1 reservation.
   val allocate = io.enabled && io.s3Fire && s3HintEvent && contextHit &&
-    !metaFull && !clearing && !rollback && !io.redirect.valid
+    !metaFull && !confFull && !clearing && !rollback && !io.redirect.valid
   when(allocate) {
     assert(!records(metaTail(3, 0)).valid)
     val r = records(metaTail(3, 0))
@@ -831,7 +930,6 @@ class Hint(implicit p: Parameters) extends BpuModule {
   val oldestRecord = records(oldestIndex)
   val drain = metaDrain =/= metaTail && oldestRecord.valid && oldestRecord.ready &&
     !rollback && !flush
-  val confFull = (confTail - confHead) === 32.U
   // The cached training confidence receives every physical write broadcast.
   // Draining metadata never consumes a second Context read port.
   val priorConf = forwardedConf(oldestRecord.setway,
@@ -864,49 +962,55 @@ class Hint(implicit p: Parameters) extends BpuModule {
     Mux(io.s3Prediction.taken, io.s3Ptr, io.s3Ptr + 1.U))
   val triggerCutoffWord = Mux(io.redirect.valid, io.redirect.bits.cfiPc.toUInt(47, 1), io.s3CfiPc(47, 1))
   val triggerKillWhole = Mux(io.redirect.valid, !io.redirect.bits.reapply, !io.s3Prediction.taken)
+  val triggerCutoffInclusive = io.redirect.valid && io.redirect.bits.flushItself
   val strongerBoundary = triggerBoundary < rollbackBoundary ||
     (triggerBoundary === rollbackBoundary &&
-      (triggerKillWhole || (!rollbackKillWhole && triggerCutoffWord < rollbackCutoffWord)))
+      (triggerKillWhole || (!rollbackKillWhole &&
+         (triggerCutoffWord < rollbackCutoffWord ||
+           (triggerCutoffWord === rollbackCutoffWord && triggerCutoffInclusive && !rollbackCutoffInclusive)))))
   val useTriggerBoundary = rollbackTrigger && (!rollback || strongerBoundary)
   val effectiveBoundary = Mux(useTriggerBoundary,
     triggerBoundary, rollbackBoundary)
   val effectiveCutoffWord = Mux(useTriggerBoundary, triggerCutoffWord, rollbackCutoffWord)
+  val effectiveCutoffInclusive = Mux(useTriggerBoundary, triggerCutoffInclusive, rollbackCutoffInclusive)
   val effectiveKillWhole = Mux(useTriggerBoundary, triggerKillWhole, rollbackKillWhole)
   when(rollbackTrigger) {
     rollback := true.B
     when(!rollback || strongerBoundary) {
       rollbackBoundary := triggerBoundary
       rollbackCutoffWord := triggerCutoffWord
+      rollbackCutoffInclusive := triggerCutoffInclusive
       rollbackKillWhole := triggerKillWhole
     }
   }
   val lastIndex = (confTail - 1.U)(4, 0)
   val last = confLog(lastIndex)
   val lastKilled = last.ptr > effectiveBoundary || (last.ptr === effectiveBoundary &&
-    (effectiveKillWhole || cam(last.camIndex)(46, 0) > effectiveCutoffWord))
+    (effectiveKillWhole || pastCutoff(cam(last.camIndex)(46, 0), effectiveCutoffWord, effectiveCutoffInclusive)))
   val lastCommitsNow = io.commit.valid && last.ptr === io.commit.bits && !lastKilled
   val undo = rollback && confTail =/= confHead && !last.committed && !lastCommitsNow &&
     lastKilled
-  val applyUpdate = !clearing && !rollback && !rollbackTrigger &&
-    !(io.load.valid && io.load.bits.kind === 2.U) &&
+  val applyRequest = !clearing && !rollback && !rollbackTrigger && !io.load.valid &&
     confWrite =/= confTail
+  val undoRequest = undo && last.applied && !clearing && !io.load.valid
+  contextTable.io.writeConf.valid := undoRequest || applyRequest
+  contextTable.io.writeConf.bits.index := Mux(undoRequest, last.setway, confLog(confWrite(4, 0)).setway)
+  contextTable.io.writeConf.bits.conf := Mux(undoRequest, last.oldConf, confLog(confWrite(4, 0)).newConf)
+  val applyUpdate = applyRequest && contextTable.io.writeConf.fire
+  val undoApplied = undoRequest && contextTable.io.writeConf.fire
   val retire = confHead =/= confTail && confLog(confHead(4, 0)).applied &&
     confLog(confHead(4, 0)).committed && !rollback && !rollbackTrigger
   when(rollback) {
     when(undo) {
-      when(last.applied) {
-        val row = context(last.setway)
-        context(last.setway) := Cat(row(24), last.oldConf, row(21, 0))
+      when(!last.applied || undoApplied) {
+        confTail := confTail - 1.U
+        when(confWrite === confTail) { confWrite := confWrite - 1.U }
       }
-      confTail := confTail - 1.U
-      when(confWrite === confTail) { confWrite := confWrite - 1.U }
     }.otherwise {
       when(!rollbackTrigger) { rollback := false.B }
     }
   }.elsewhen(applyUpdate) {
     val req = confLog(confWrite(4, 0))
-    val row = context(req.setway)
-    context(req.setway) := Cat(row(24), req.newConf, row(21, 0))
     confLog(confWrite(4, 0)).applied := true.B
     confWrite := confWrite + 1.U
   }
@@ -925,20 +1029,12 @@ class Hint(implicit p: Parameters) extends BpuModule {
     broadcastSetway := confLog(confWrite(4, 0)).setway
     broadcastConf := confLog(confWrite(4, 0)).newConf
   }
-  when(undo && last.applied) {
+  when(undoApplied) {
     writeBroadcast := true.B
     broadcastSetway := last.setway
     broadcastConf := last.oldConf
   }
   when(writeBroadcast) {
-    when(!lookupFire) {
-      s2Row0 := mergeConf(s2Row0, Cat(s2Set, 0.U(1.W)))
-      s2Row1 := mergeConf(s2Row1, Cat(s2Set, 1.U(1.W)))
-    }
-    when(!io.s2Fire) {
-      s3Row0 := mergeConf(s3Row0, Cat(s3Set, 0.U(1.W)))
-      s3Row1 := mergeConf(s3Row1, Cat(s3Set, 1.U(1.W)))
-    }
     for (i <- 0 until 16) {
       when(records(i).valid && records(i).setway === broadcastSetway) {
         records(i).trainConf := broadcastConf
@@ -950,10 +1046,7 @@ class Hint(implicit p: Parameters) extends BpuModule {
   assert((metaDrain - metaHead)(4, 0) <= (metaTail - metaHead)(4, 0))
   assert((confTail - confHead)(5, 0) <= 32.U)
   assert((confWrite - confHead)(5, 0) <= (confTail - confHead)(5, 0))
-  when(io.enabled && !clearing) {
-    assert((confTail - confWrite)(5, 0) <= 1.U)
-    assert((confTail - confHead)(5, 0) <= 17.U)
-  }
+  assert((confTail - confWrite)(5, 0) <= 32.U)
   when(io.load.valid) {
     assert(!io.enabled && !io.profile)
     assert(metaHead === metaTail && confHead === confTail)
@@ -975,29 +1068,38 @@ class Hint(implicit p: Parameters) extends BpuModule {
   val lhrAppend = (io.s1Fire && s1HintEvent && !flush) ||
     (io.s3Override && !io.redirect.valid && io.s3Prediction.taken &&
       io.s3Prediction.attribute.needIttage && s3Exact.asUInt.orR) ||
-    (io.redirect.valid && io.redirect.bits.reapply && io.redirect.bits.taken &&
+    (io.redirect.valid && io.redirect.bits.reapply && !io.redirect.bits.flushItself && io.redirect.bits.taken &&
       io.redirect.bits.attribute.needIttage && redirectH2p)
   io.stats.lhrWrites := count((io.enabled || io.profile) && lhrAppend)
   io.stats.confFullWait := count(drain && needsConf && confFull)
   io.stats.confApply := count(applyUpdate)
-  io.stats.confUndo := count(undo && last.applied)
+  io.stats.confUndo := count(undoApplied)
   io.stats.confAccepted := count(drain && needsConf && !confFull)
   io.stats.confCanceled := count(undo && !last.applied)
   io.stats.confRetired := count(retire)
 
-  io.load.ready := !clearing && !rollback && (!readContext || io.load.bits.kind =/= 2.U)
-  when(clearing) {
-    context(clearIndex) := 0.U
-    clearIndex := clearIndex + 1.U
-    when(clearIndex === 4095.U) { clearing := false.B }
-  }
+  contextTable.io.load.valid := io.load.valid && io.load.bits.kind === 2.U && !clearing && !rollback
+  contextTable.io.load.bits.index := io.load.bits.index
+  contextTable.io.load.bits.data := io.load.bits.data(24, 0)
+  slotTable.io.load.valid := io.load.valid && io.load.bits.kind === 3.U && !clearing && !rollback
+  slotTable.io.load.bits.index := io.load.bits.index(4, 0)
+  slotTable.io.load.bits.data := io.load.bits.data(46, 0)
+  val resetDone = contextTable.io.resetDone && slotTable.io.resetDone
+  clearFire := io.load.valid && io.load.bits.kind === 0.U && !clearing && !rollback && resetDone
+  when(io.load.bits.kind === 0.U) { assert(clearFire === io.load.fire) }
+  io.load.ready := !clearing && !rollback && resetDone && MuxLookup(io.load.bits.kind, true.B)(Seq(
+    2.U -> contextTable.io.load.ready,
+    3.U -> slotTable.io.load.ready))
+  // The explicit busy register spans the Clear acceptance edge even though
+  // resetDone still describes the previous image on that edge.
+  when(clearing && resetDone && !clearFire) { clearing := false.B }
+  io.tableReady := resetDone && !clearing && !io.load.valid && !rollback &&
+    metaHead === metaTail && confHead === confTail && !s2ReadValid && !s3ReadValid && !s3SlotValid
   when(io.load.fire) {
     switch(io.load.bits.kind) {
       is(0.U) {
         clearing := true.B
-        clearIndex := 0.U
         cam.foreach(_ := 0.U)
-        slots.foreach(_ := 0.U)
         ith.foreach(_ := 0.U)
         calls.foreach(_ := 0.U)
         rets.foreach(_ := 0.U)
@@ -1019,8 +1121,8 @@ class Hint(implicit p: Parameters) extends BpuModule {
         confDropped := 0.U
       }
       is(1.U) { when(io.load.bits.index < 16.U) { cam(io.load.bits.index(3, 0)) := io.load.bits.data(51, 0) } }
-      is(2.U) { context(io.load.bits.index) := io.load.bits.data(24, 0) }
-      is(3.U) { when(io.load.bits.index < 32.U) { slots(io.load.bits.index(4, 0)) := io.load.bits.data(46, 0) } }
+      is(2.U) { assert(contextTable.io.load.fire) }
+      is(3.U) { assert(io.load.bits.index < 32.U); assert(slotTable.io.load.fire) }
     }
   }
 }

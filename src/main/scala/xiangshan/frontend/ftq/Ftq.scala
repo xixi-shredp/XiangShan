@@ -406,13 +406,18 @@ class Ftq(implicit p: Parameters) extends FtqModule
   io.toIfu.redirect.bits := DontCare
 
   io.toBpu.redirect.valid          := redirect.valid
-  io.toBpu.redirect.bits.cfiPc     := getCfiPcFromOffset(PcInit(redirect.bits.pc), redirect.bits.ftqOffset)
+  // Redirect.pc differs across producers: load replay already supplies a real PC.
+  // The resident FTQ entry and its instruction offset have one common contract.
+  // writeEntry is disabled on redirect, so this reads the original generation.
+  io.toBpu.redirect.bits.cfiPc     := getCfiPcFromOffset(
+    entryQueue(redirect.bits.ftqIdx.value).startPc.unGuard, redirect.bits.ftqOffset)
   io.toBpu.redirect.bits.target    := redirect.bits.target
   io.toBpu.redirect.bits.taken     := redirect.bits.taken
   io.toBpu.redirect.bits.attribute := redirect.bits.attribute
   io.toBpu.redirect.bits.meta      := RegNext(metaQueueRedirect(redirectFtqIdxInAdvance.value))
   io.toBpu.redirect.bits.newFtqIdx := redirect.bits.newFtqIdx
   io.toBpu.redirect.bits.reapply   := redirect.bits.newFtqIdx =/= redirect.bits.ftqIdx
+  io.toBpu.redirect.bits.flushItself := redirect.bits.flushItself()
   io.toBpu.redirectFromIFU         := ifuRedirect.valid
 
   (io.fromBackend.resolve :+ ifuResolve).zip(io.toBpu.hintResolve).zipWithIndex.foreach { case ((src, dst), sourceIndex) =>
@@ -430,6 +435,35 @@ class Ftq(implicit p: Parameters) extends FtqModule
     dst.bits.offset := src.bits.ftqOffset
     dst.bits.mispredict := src.bits.mispredict
     dst.bits.sourceBackend := (sourceIndex < io.fromBackend.resolve.length).B
+  }
+
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    Seq(backendRedirect, ifuRedirect, redirect).zipWithIndex.foreach { case (r, source) =>
+      val raw = r.bits
+      val ent = entryQueue(raw.ftqIdx.value)
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,10,source,r.valid,
+        Seq(raw.ftqIdx.asUInt,raw.newFtqIdx.asUInt,raw.pc,raw.ftqOffset,
+          raw.isRVC.asUInt,raw.level.asUInt,raw.robIdx.asUInt,
+          raw.target,raw.taken.asUInt,raw.attribute.asUInt,
+          ent.startPc.toUInt,io.toBpu.redirect.bits.cfiPc.toUInt,
+          Cat(raw.debugIsMemVio,raw.debugIsCtrl,raw.isMisPred,raw.flushItself()),
+          (source == 2).B.asUInt))
+    }
+    (io.fromBackend.resolve :+ ifuResolve).zipWithIndex.foreach { case (r, lane) =>
+      val ent = entryQueue(r.bits.ftqIdx.value)
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,11,lane,r.valid,
+        Seq(r.bits.ftqIdx.asUInt,r.bits.pc.toUInt,r.bits.ftqOffset,
+          r.bits.debug_isRVC.get.asUInt,r.bits.target.toUInt,r.bits.taken.asUInt,
+          r.bits.mispredict.asUInt,r.bits.attribute.asUInt,ent.startPc.toUInt,
+          io.toBpu.hintResolve(lane).bits.cfiPc,
+          getRealCfiPcFromOffset(r.bits.pc,r.bits.ftqOffset,r.bits.debug_isRVC.get),
+          (lane < io.fromBackend.resolve.length).B.asUInt))
+    }
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,12,0,writeEntry,
+      Seq(predictionPtr.asUInt,prediction.bits.startPc.toUInt,
+        prediction.bits.endPosition.asUInt,prediction.bits.target.toUInt,
+        prediction.bits.s3Override.asUInt))
   }
 
   resolveQueue.io.backendRedirect    := backendRedirect.valid
@@ -891,4 +925,20 @@ class Ftq(implicit p: Parameters) extends FtqModule
     ) ++ TwoFetchFailReason.getValidSeq(io.fromICache.fromMainPipe.perf_twoFetchFailReason),
     withPriority = true
   )
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    io.toBpu.train.bits.branches.zipWithIndex.foreach { case (b,lane) =>
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,18,lane,io.toBpu.train.fire,
+        Seq(trainIndexCache.asUInt,io.toBpu.train.bits.startPc.toUInt,
+          b.valid.asUInt,b.bits.cfiPosition,b.bits.target.toUInt,b.bits.taken.asUInt,
+          b.bits.mispredict.asUInt,b.bits.attribute.asUInt,
+          b.bits.debug_realCfiPc.get,io.toBpu.train.bits.debug_source))
+    }
+    val rawIfu = io.fromIfu.wbRedirect
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,19,0,rawIfu.valid,
+      Seq(rawIfu.bits.ftqIdx.asUInt,rawIfu.bits.pc,rawIfu.bits.ftqOffset,
+        rawIfu.bits.isRVC.asUInt,rawIfu.bits.target,rawIfu.bits.taken.asUInt,
+        rawIfu.bits.attribute.asUInt,rawIfu.bits.canTrain.asUInt,backendRedirect.valid.asUInt))
+  }
+
 }

@@ -814,6 +814,32 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   val blockCommit = misPredBlock || lastCycleFlush || hasWFI || io.redirect.valid ||
     (deqNeedFlush && !deqHasFlushed) || deqFlushBlock || criticalErrorState || traceBlock
 
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    val causes = Cat(traceBlock,criticalErrorState,deqFlushBlock,
+      deqNeedFlush && !deqHasFlushed,io.redirect.valid,hasWFI,lastCycleFlush,misPredBlock)
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,15,0,true.B,
+      Seq(deqPtr.asUInt,state.asUInt,deqPtrEntryValid.asUInt,
+        deqPtrEntry.commit_w.asUInt,blockCommit.asUInt,causes,
+        deqPtrEntry.ftqIdx.asUInt,deqPtrEntry.ftqOffset,
+        debug_deqUop.debug_pc.getOrElse(0.U),debug_deqUop.debug_fuType.getOrElse(0.U),debug_deqUop.debug_commitType.getOrElse(0.U),
+        io.commits.isCommit.asUInt,io.commits.commitValid.asUInt,
+        debug_deqUop.isWritebacked.asUInt,debug_deqUop.isUopWritebacked.asUInt,debug_deqUop.uopNum))
+  }
+
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    for (lane <- 0 until CommitWidth) {
+      val entry = robEntries(deqPtrVec(lane).value)
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,16,lane,
+        io.commits.isCommit && io.commits.commitValid(lane),
+        Seq(deqPtrVec(lane).asUInt,entry.debug_seqNum.map(_.asUInt).getOrElse(0.U),
+          entry.debug_pc.getOrElse(0.U),entry.debug_instr.getOrElse(0.U),
+          entry.ftqIdx.asUInt,entry.ftqOffset,entry.isRVC.asUInt,
+          io.debugRetiredBase.get,io.debugRetiredSizes.get(lane)))
+    }
+  }
+
   io.commits.isWalk := state === s_walk
   io.commits.isCommit := state === s_idle && !blockCommit
 

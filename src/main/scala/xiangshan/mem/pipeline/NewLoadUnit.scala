@@ -429,6 +429,16 @@ class LoadUnitS0(param: ExeUnitParams)(
   io.fastReplay.ready := fastReplay.ready
   io.prefetchReq.ready := Mux(prefetchIsHiConf, prefetchHiConf.ready, prefetchLoConf.ready)
   io.vecldin.ready := vectorIssue.ready
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    Seq(scalarIssue,replayHiPrio,fastReplay,replayLoPrio).zipWithIndex.foreach { case (port,lane) =>
+      val u = port.bits.uop
+      xiangshan.DiagnosticDpi.emit(clock,reset,dc,20,((param.name.hashCode & 0x1fffffff) * 4 + lane),port.fire && port.bits.hasROBEntry && port.bits.accessType.isScalar(),
+        Seq(u.robIdx.asUInt,u.ftqPtr.asUInt,u.ftqOffset,u.pc,u.lqIdx.asUInt,
+          u.debug_seqNum.asUInt,port.bits.vaddr,port.bits.entrance))
+    }
+  }
+
   io.ldin.ready := scalarIssue.ready
 
   io.tlbReq.valid := tlbReqValid
@@ -810,6 +820,13 @@ class LoadUnitS1(param: ExeUnitParams)(
    *  Perf counters
    */
   val fire = pipeIn.fire && !kill
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,21,param.name.hashCode & 0x7fffffff,fire && in.hasROBEntry && in.accessType.isScalar(),
+      Seq(uop.robIdx.asUInt,uop.ftqPtr.asUInt,uop.ftqOffset,uop.pc,
+        uop.lqIdx.asUInt,uop.debug_seqNum.asUInt,in.vaddr,tlbMiss.asUInt,kill.asUInt,in.entrance))
+  }
+
   XSPerfAccumulate("valid", pipeIn.valid)
   XSPerfAccumulate("fire", fire)
   XSPerfAccumulate("fire_first_issue", fire && in.isFirstIssue())
@@ -1230,6 +1247,15 @@ class LoadUnitS2(param: ExeUnitParams)(
    *  Perf counters
    */
   val fire = pipeIn.fire && !kill
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,22,param.name.hashCode & 0x7fffffff,fire && in.hasROBEntry && in.accessType.isScalar(),
+      Seq(uop.robIdx.asUInt,uop.ftqPtr.asUInt,uop.ftqOffset,uop.pc,
+        uop.lqIdx.asUInt,uop.debug_seqNum.asUInt,in.vaddr,kill.asUInt,in.entrance,
+        tlbMiss.asUInt,dcacheMiss.asUInt,mshrNack.asUInt,bankConflict.asUInt,
+        fullForward.asUInt,cause.asUInt,in.paddr.get))
+  }
+
   XSPerfAccumulate("valid", pipeIn.valid)
   XSPerfAccumulate("fire", fire)
   XSPerfAccumulate("fire_first_issue", fire && in.isFirstIssue())
@@ -1694,6 +1720,13 @@ class LoadUnitS3(param: ExeUnitParams)(
   io_pipeOut.get.bits := pipeOutBits
   io_pipeIn.get.ready := !pipeOutValid || kill || endPipe || pipeOut.ready
 
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,23,param.name.hashCode & 0x7fffffff,(io.ldout.toRob.fire || io.lqWrite.fire || io.fastReplay.fire || io.rollback.valid) && in.hasROBEntry && in.accessType.isScalar(),
+      Seq(uop.robIdx.asUInt,uop.ftqPtr.asUInt,uop.ftqOffset,uop.pc,
+        uop.lqIdx.asUInt,uop.debug_seqNum.asUInt,in.vaddr,paddr,lqWriteCause.asUInt,VecInit(lqWriteCauseOH).asUInt,lqWriteMshrId,Cat(io.rollback.valid,io.fastReplay.fire,io.lqWrite.fire,io.ldout.toRob.fire),kill.asUInt,in.entrance))
+  }
+
   io.ldout := ldout
   io.lqWrite.valid := lqWriteValid
   io.lqWrite.bits := lqWrite
@@ -2119,6 +2152,19 @@ class NewLoadUnit(val param: ExeUnitParams)(implicit p: Parameters) extends XSMo
   io.ldout.toFpRf.foreach(_.bits.data := dataPath.io.s3ShiftAndExtData(io.ldout.toFpRf.get.bits.data.getWidth - 1, 0))
   io.ldout.toIntRf.foreach(_.bits.data := dataPath.io.s3ShiftAndExtData(io.ldout.toIntRf.get.bits.data.getWidth - 1, 0))
   io.vecldout.bits.vecdata.get := dataPath.io.s3ShiftData
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    val intValid = io.ldout.toIntRf.map(_.valid).getOrElse(false.B)
+    val fpValid = io.ldout.toFpRf.map(_.valid).getOrElse(false.B)
+    xiangshan.DiagnosticDpi.emit(clock,reset,dc,26,param.name.hashCode & 0x7fffffff,
+      io.ldout.toRob.valid || intValid || fpValid,
+      Seq(io.ldout.toRob.bits.robIdx.asUInt,
+        io.ldout.toRob.bits.debugInfo.debug_seqNum.map(_.asUInt).getOrElse(0.U),
+        io.ldout.toRob.valid.asUInt,intValid.asUInt,fpValid.asUInt,
+        io.ldout.toIntRf.map(_.bits.data).getOrElse(0.U),
+        io.ldout.toFpRf.map(_.bits.data).getOrElse(0.U)))
+  }
+
 
   // rr bank-conflict fast replay arbiter
   val rrBankConflictFastReplay = io.rrBankConflictFastReplay

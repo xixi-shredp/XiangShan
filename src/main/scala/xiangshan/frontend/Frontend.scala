@@ -160,6 +160,7 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
     hintDpi.io.clock := clock
     hintDpi.io.reset := reset.asBool
     hintDpi.io.loadReady := bpu.io.hintLoad.ready
+    hintDpi.io.tableReady := bpu.io.hintTableReady
     hintDpi.io.stats := bpu.io.hintStats
     bpu.io.hintLoad.valid := hintDpi.io.loadValid
     bpu.io.hintLoad.bits.kind := hintDpi.io.loadKind

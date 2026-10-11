@@ -194,6 +194,24 @@ class MainBtbInternalBank(
   counterWriteBuffer.io.enq.bits.wayMask  := writeCounter.req.bits.wayMask
   counterWriteBuffer.io.enq.bits.counters := writeCounter.req.bits.counters
 
+  // Observe the actual buffer and single-port SRAM handshake, not just upstream requests.
+  if (!env.FPGAPlatform) {
+    val dc = xiangshan.DiagnosticDpi.cycle()
+    (entrySrams zip entryWriteBuffer.io.read).zipWithIndex.foreach { case ((way, rd), wayIdx) =>
+      val wr = entryWriteBuffer.io.write(wayIdx)
+      val overwritten = entryWriteBuffer.io.overwrite(wayIdx)
+      val flags = Cat(overwritten, way.io.w.req.fire, way.io.w.req.ready,
+        way.io.w.req.valid, way.io.r.req.valid)
+      xiangshan.DiagnosticDpi.emit(clock, reset, dc, 30,
+        (alignIdx * NumInternalBanks + bankIdx) * NumWay + wayIdx,
+        wr.valid || rd.valid || way.io.w.req.fire || overwritten,
+        Seq(wr.valid.asUInt, wr.bits.setIdx, wr.bits.entry.tag,
+          wr.bits.entry.position, wr.bits.entry.attribute.asUInt, wr.bits.entry.targetLowerBits,
+          rd.valid.asUInt, rd.ready.asUInt, rd.bits.setIdx, rd.bits.entry.tag,
+          rd.bits.entry.position, rd.bits.entry.attribute.asUInt, rd.bits.entry.targetLowerBits,
+          flags, way.io.w.req.bits.setIdx, way.io.r.req.bits.setIdx))
+    }
+  }
   private val perfEntryOverwrite = entryWriteBuffer.io.overwrite.reduce(_ || _)
 
   XSPerfAccumulate(

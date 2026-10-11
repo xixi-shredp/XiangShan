@@ -226,6 +226,8 @@ class BpuRedirect(implicit p: Parameters) extends BpuBundle {
   val meta:      BpuRedirectMeta = new BpuRedirectMeta
   val newFtqIdx: FtqPtr = new FtqPtr
   val reapply: Bool = Bool()
+  // Flush level is independent of whether the old FTQ keeps an earlier prefix.
+  val flushItself: Bool = Bool()
 }
 
 class BranchInfo(implicit p: Parameters) extends BpuBundle with HalfAlignHelper {
