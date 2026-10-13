@@ -297,6 +297,7 @@ class Resolve(implicit p: Parameters) extends XSBundle {
   val taken: Bool = Bool()
   val mispredict: Bool = Bool()
   val attribute: BranchAttribute = new BranchAttribute
+  val isRVC: Bool = Bool()
   val debug_isRVC: Option[Bool] = Option.when(!env.FPGAPlatform)(Bool())
 }
 

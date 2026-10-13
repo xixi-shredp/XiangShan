@@ -39,7 +39,7 @@ import xiangshan.frontend.bpu.BpuRedirect
 import xiangshan.frontend.bpu.BpuTrain
 import xiangshan.frontend.bpu.BranchAttribute
 import xiangshan.frontend.bpu.BranchInfo
-import xiangshan.frontend.bpu.hint.HintResolve
+import xiangshan.frontend.bpu.hint.{HintResolve, HintTraceCommit}
 import xiangshan.frontend.ibuffer.IBufPtr
 import xiangshan.frontend.icache.HasICacheParameters
 import xiangshan.frontend.icache.ICacheCacheLineHelper
@@ -68,6 +68,7 @@ class FtqToBpuIO(implicit p: Parameters) extends FrontendBundle {
   val bpuPtr:          FtqPtr                = Output(new FtqPtr)
   val redirectFromIFU: Bool                  = Output(Bool())
   val hintCommit: Valid[FtqPtr] = Valid(new FtqPtr)
+  val hintTraceCommit = Valid(new HintTraceCommit)
   val hintResolve: Vec[Valid[HintResolve]] =
     Vec(backendParams.BrhCnt + 1, Valid(new HintResolve))
 }

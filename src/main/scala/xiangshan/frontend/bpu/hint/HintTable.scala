@@ -20,7 +20,8 @@ class HintSlotLoad extends Bundle {
 }
 
 /** One logical Context port: prediction reads both ways, writes wait.
-  * Metadata is immutable during execution; confidence writes need no read.
+  * Metadata is immutable during execution. Training reads and writes the
+  * confidence SRAM only, and can never steal a prediction read cycle.
   */
 class HintContextTable(implicit p: Parameters) extends BpuModule {
   val io = IO(new Bundle {
@@ -30,6 +31,9 @@ class HintContextTable(implicit p: Parameters) extends BpuModule {
     val rows = Output(Vec(2, UInt(25.W)))
     val respValid = Output(Bool())
     val readSet = Output(UInt(11.W))
+    val trainRead = Flipped(Decoupled(UInt(12.W)))
+    val trainRespValid = Output(Bool())
+    val trainConf = Output(UInt(2.W))
     val load = Flipped(Decoupled(new HintContextLoad))
     val writeConf = Flipped(Decoupled(new HintConfidenceWrite))
   })
@@ -48,14 +52,16 @@ class HintContextTable(implicit p: Parameters) extends BpuModule {
   private val pairedReadReady = meta.io.r.req.ready && conf.io.r.req.ready
   private val pairedWriteReady = meta.io.w.req.ready && conf.io.w.req.ready
   io.read.ready := available && pairedReadReady
-  private val readGrant = io.read.valid && available
-  meta.io.r.req.valid := readGrant && pairedReadReady
-  conf.io.r.req.valid := readGrant && pairedReadReady
+  private val readGrant = io.read.valid && available && pairedReadReady
+  io.trainRead.ready := available && !io.read.valid && !io.load.valid && conf.io.r.req.ready
+  private val trainReadGrant = io.trainRead.valid && io.trainRead.ready
+  meta.io.r.req.valid := readGrant
+  conf.io.r.req.valid := readGrant || trainReadGrant
   meta.io.r.req.bits.setIdx := io.read.bits
-  conf.io.r.req.bits.setIdx := io.read.bits
+  conf.io.r.req.bits.setIdx := Mux(readGrant, io.read.bits, io.trainRead.bits(11, 1))
 
-  io.load.ready := available && !io.read.valid && pairedWriteReady
-  io.writeConf.ready := available && !io.read.valid && !io.load.valid && conf.io.w.req.ready
+  io.load.ready := available && !io.read.valid && !io.trainRead.valid && pairedWriteReady
+  io.writeConf.ready := available && !io.read.valid && !io.trainRead.valid && !io.load.valid && conf.io.w.req.ready
   private val loadGrant = io.load.valid && io.load.ready
   private val confGrant = io.writeConf.valid && io.writeConf.ready
   private val loadWay = UIntToOH(io.load.bits.index(0), 2)
@@ -66,17 +72,29 @@ class HintContextTable(implicit p: Parameters) extends BpuModule {
     VecInit(Seq.fill(2)(Mux(loadGrant, io.load.bits.data(23, 22), io.writeConf.bits.conf))),
     Mux(loadGrant, io.load.bits.index(11, 1), io.writeConf.bits.index(11, 1)),
     Mux(loadGrant, loadWay, confWay))
-  for (way <- 0 until 2) {
-    val m = meta.io.r.resp.data(way)
-    io.rows(way) := Cat(m(22), conf.io.r.resp.data(way), m(21, 0))
-  }
   private val responseValid = RegNext(io.read.fire, false.B)
   when(io.clear) { responseValid := false.B }
+  // A confidence-only training read changes the physical held SRAM response.
+  // Preserve the last prediction response separately (four bits, no bypass).
+  private val predictionConf = Reg(Vec(2, UInt(2.W)))
+  for (way <- 0 until 2) {
+    val m = meta.io.r.resp.data(way)
+    val raw = conf.io.r.resp.data(way)
+    when(responseValid) { predictionConf(way) := raw }
+    io.rows(way) := Cat(m(22), Mux(responseValid, raw, predictionConf(way)), m(21, 0))
+  }
   io.respValid := responseValid
   io.readSet := RegEnable(io.read.bits, io.read.fire)
-  assert(meta.io.r.req.fire === conf.io.r.req.fire)
+  private val trainingResponseValid = RegNext(io.trainRead.fire, false.B)
+  when(io.clear) { trainingResponseValid := false.B }
+  private val trainingWay = RegEnable(io.trainRead.bits(0), io.trainRead.fire)
+  io.trainRespValid := trainingResponseValid
+  io.trainConf := conf.io.r.resp.data(trainingWay)
+  assert(meta.io.r.req.fire === io.read.fire)
+  assert(conf.io.r.req.fire === (io.read.fire || io.trainRead.fire))
   assert(!loadGrant || (meta.io.w.req.fire && conf.io.w.req.fire))
-  assert(!(io.read.fire && (loadGrant || confGrant)))
+  assert(!(io.read.fire && io.trainRead.fire))
+  assert(!((io.read.fire || io.trainRead.fire) && (loadGrant || confGrant)))
   assert(!meta.io.w.req.fire || loadGrant)
 }
 

@@ -17,6 +17,7 @@ class HintDpi extends BlackBox with HasBlackBoxInline {
     val enabled = Output(Bool())
     val profile = Output(Bool())
     val measure = Output(Bool())
+    val traceMode = Output(UInt(2.W))
     val stats = Input(new HintStats)
   })
 
@@ -33,6 +34,7 @@ module HintDpi (
   output logic        enabled,
   output logic        profile,
   output logic        measure,
+  output logic [1:0]  traceMode,
   input logic [31:0] stats_camMiss,
   input logic [31:0] stats_contextMiss,
   input logic [31:0] stats_confZero,
@@ -64,6 +66,7 @@ module HintDpi (
     output bit valid, output byte unsigned kind,
     output int unsigned index, output longint unsigned data,
     output bit enabled, output bit profile, output bit measure);
+  import "DPI-C" function int unsigned h2p_hint_trace_mode();
   import "DPI-C" function void h2p_hint_extended_stats(
     input int unsigned lookupPortFallback, metadataFallback, rollbackFallback, clearingFallback, s3Confirmed, recordAllocate, lhrWrites, confFullWait, confApply, confUndo, confAccepted, confCanceled, confRetired);
   import "DPI-C" function void h2p_hint_ack(input bit reset, input bit valid, input bit ready);
@@ -78,7 +81,7 @@ module HintDpi (
   longint unsigned dpiData;
   initial begin
     loadValid = 0; loadKind = 0; loadIndex = 0; loadData = 0;
-    enabled = 0; profile = 0; measure = 0;
+    enabled = 0; profile = 0; measure = 0; traceMode = 0;
   end
   always @(posedge clock) h2p_hint_ack(reset, loadValid, loadReady);
   always @(negedge clock) begin
@@ -88,6 +91,7 @@ module HintDpi (
                   stats_confUp, stats_confDown, stats_confDropped,
                   loadValid, dpiKind,
                   dpiIndex, dpiData, enabled, profile, measure);
+    traceMode = h2p_hint_trace_mode();
     loadKind = dpiKind[1:0];
     loadIndex = dpiIndex[11:0];
     loadData = dpiData;

@@ -69,7 +69,7 @@ import xiangshan.frontend.ifu.Ifu
 import xiangshan.frontend.instruncache.InstrUncache
 import xiangshan.frontend.simfrontend.SimFrontendInlinedImp
 import xiangshan.frontend.bpu.hint.HintDpi
-import xiangshan.frontend.bpu.hint.HintProfileDpi
+import xiangshan.frontend.bpu.hint.{HintProfileDpi, HintTraceDpi, HintTraceQueue}
 import xiangshan.frontend.bpu.hint.HintReplayDpi
 
 class FrontendIO(implicit p: Parameters) extends FrontendBundle {
@@ -169,23 +169,46 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
     bpu.io.hintEnabled := hintDpi.io.enabled
     bpu.io.hintProfile := hintDpi.io.profile
     bpu.io.hintMeasureActive := hintDpi.io.measure
+    // Hardware trace storage has one producer (the existing FTQ commit lane).
+    // DPIC consumes it independently; no ready signal returns to the core.
+    val traceQueue = Module(new HintTraceQueue)
+    val wasCollecting = RegNext(hintDpi.io.profile && hintDpi.io.measure, false.B)
+    val wasProfiling = RegNext(hintDpi.io.profile, false.B)
+    traceQueue.io.clear := hintDpi.io.profile && !wasProfiling
+    traceQueue.io.collect := hintDpi.io.profile && hintDpi.io.measure
+    traceQueue.io.discovery := hintDpi.io.traceMode === 1.U
+    traceQueue.io.stop := wasCollecting && !hintDpi.io.measure
+    traceQueue.io.discoveryEvent := bpu.io.hintTraceCommit
+    traceQueue.io.detailEvent := bpu.io.hintProfileEvent
+    traceQueue.io.out.ready := true.B
+    val traceDpi = Module(new HintTraceDpi)
+    traceDpi.io.clock := clock
+    traceDpi.io.valid := traceQueue.io.out.valid
+    traceDpi.io.data := traceQueue.io.out.bits.data
+    traceDpi.io.discovery := traceQueue.io.discovery
+    traceDpi.io.ftqTag := traceQueue.io.out.bits.ftqTag.get
+    traceDpi.io.queryCycle := traceQueue.io.out.bits.queryCycle.get
+    traceDpi.io.overflow := traceQueue.io.overflow
+    traceDpi.io.occupancy := traceQueue.io.occupancy
+    // The existing simulation identity journal remains separate from packed
+    // hardware records. It carries actual baseline values, never fabricated.
     val hintProfileDpi = Module(new HintProfileDpi)
     hintProfileDpi.io.clock := clock
     hintProfileDpi.io.valid := bpu.io.hintProfileEvent.valid
-    hintProfileDpi.io.pc := bpu.io.hintProfileEvent.bits.pc
-    hintProfileDpi.io.actual := bpu.io.hintProfileEvent.bits.actual
-    hintProfileDpi.io.baselinePc := bpu.io.hintProfileEvent.bits.baselinePc
-    hintProfileDpi.io.baselineTarget := bpu.io.hintProfileEvent.bits.baselineTarget
-    hintProfileDpi.io.baselineValid := bpu.io.hintProfileEvent.bits.baselineValid
-    hintProfileDpi.io.blockStart := bpu.io.hintProfileEvent.bits.blockStart
-    hintProfileDpi.io.queryCycle := bpu.io.hintProfileEvent.bits.queryCycle
+    hintProfileDpi.io.pc := bpu.io.hintProfileEvent.bits.actualPc
+    hintProfileDpi.io.actual := bpu.io.hintProfileEvent.bits.actualTarget
+    hintProfileDpi.io.baselinePc := bpu.io.hintTraceCommit.bits.baselinePc.get
+    hintProfileDpi.io.baselineTarget := bpu.io.hintTraceCommit.bits.baselineTarget.get
+    hintProfileDpi.io.baselineValid := bpu.io.hintTraceCommit.bits.baselineValid.get
+    hintProfileDpi.io.blockStart := bpu.io.hintProfileEvent.bits.queryStartPc
+    hintProfileDpi.io.queryCycle := bpu.io.hintProfileEvent.bits.queryCycle.get
     hintProfileDpi.io.ftqTag := bpu.io.hintProfileEvent.bits.ftqTag
-    hintProfileDpi.io.ith := bpu.io.hintProfileEvent.bits.ith
-    hintProfileDpi.io.lhr := bpu.io.hintProfileEvent.bits.lhr
-    hintProfileDpi.io.call := bpu.io.hintProfileEvent.bits.call
-    hintProfileDpi.io.ret := bpu.io.hintProfileEvent.bits.ret
-    hintProfileDpi.io.eligible := bpu.io.hintProfileEvent.bits.eligible
-    hintProfileDpi.io.observed := bpu.io.hintProfileEvent.bits.observed
+    hintProfileDpi.io.ith := Mux(bpu.io.hintProfileEvent.bits.queryValid, bpu.io.hintProfileEvent.bits.ith, 0.U)
+    hintProfileDpi.io.lhr := Mux(bpu.io.hintProfileEvent.bits.queryValid, bpu.io.hintProfileEvent.bits.lhr, 0.U)
+    hintProfileDpi.io.call := Mux(bpu.io.hintProfileEvent.bits.queryValid, bpu.io.hintProfileEvent.bits.call, 0.U)
+    hintProfileDpi.io.ret := Mux(bpu.io.hintProfileEvent.bits.queryValid, bpu.io.hintProfileEvent.bits.ret, 0.U)
+    hintProfileDpi.io.eligible := bpu.io.hintProfileEvent.bits.queryValid
+    hintProfileDpi.io.observed := true.B
     val hintReplayDpi = Module(new HintReplayDpi)
     hintReplayDpi.io.clock := clock
     hintReplayDpi.io.valid := bpu.io.hintReplayEvent.valid

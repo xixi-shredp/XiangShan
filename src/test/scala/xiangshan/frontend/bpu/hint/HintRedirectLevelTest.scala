@@ -31,8 +31,9 @@ class HintRedirectLevelTest extends AnyFlatSpec with ChiselSim {
     }
   behavior of "Hint redirect coordinates and flush level"
   it should "retain earlier branches and cancel inclusive, late and concurrent wrong-path state" in {
-    simulate(new Hint, firtoolOpts = Array("-O=release",
-      "--lowering-options=explicitBitcast,disallowLocalVariables,disallowPortDeclSharing,locationInfoStyle=none")) { m =>
+    simulate(new HintSramTestTop, firtoolOpts = Array("-O=release",
+      "--lowering-options=explicitBitcast,disallowLocalVariables,disallowPortDeclSharing,locationInfoStyle=none")) { top =>
+      val m=new {val io=top.io.hint;val clock=top.clock;val reset=top.reset}
       var checks = 0
       def zero(d: Data): Unit = d match {
         case x: Bool => x.poke(false.B)
@@ -55,6 +56,7 @@ class HintRedirectLevelTest extends AnyFlatSpec with ChiselSim {
       }
       def reset(profile: Boolean, hardware: Boolean = false): Unit = {
         zero(m.io.load.bits); zero(m.io.redirect.bits); zero(m.io.commit.bits)
+        zero(m.io.traceCommit.bits);m.io.traceCommit.valid.poke(false.B)
         m.io.resolve.foreach(r => { r.valid.poke(false.B); zero(r.bits) })
         zero(m.io.s1Prediction); zero(m.io.s3Prediction)
         m.io.load.valid.poke(false.B); m.io.enabled.poke(false.B); m.io.profile.poke(false.B)
@@ -112,58 +114,36 @@ class HintRedirectLevelTest extends AnyFlatSpec with ChiselSim {
       def redirect(saved: Seq[() => Unit], pc: Int, self: Boolean): Unit = {
         setRedirect(saved,pc,self); tick(); m.io.redirect.valid.poke(false.B)
       }
-      def event(valid: Boolean, pc: Int = 0x1000, id: Int = 10): Unit = {
-        ptr(m.io.commit.bits,id); m.io.commit.valid.poke(true.B)
-        m.io.profileEvent.valid.expect(valid.B)
-        if(valid) m.io.profileEvent.bits.pc.expect(pc.U)
-        m.io.commit.valid.poke(false.B); checks += 1
+      def confirm():Unit={
+        m.io.s3UsedHint.poke(true.B);m.io.s3Fire.poke(true.B);tick()
+        m.io.s3Fire.poke(false.B);m.io.s3UsedHint.poke(false.B)
       }
-      // All six ordering/level outcomes and persistent late-resolution behavior.
-      for(self <- Seq(false,true); cutoff <- Seq(0xffe,0x1000,0x1002)) {
-        reset(profile=true); val s=query(); resolve(); redirect(s,cutoff,self); tick(2)
-        val survives = cutoff>0x1000 || cutoff==0x1000 && !self
-        event(survives); resolve(); tick(2); event(survives)
+      def commit(id:Int=10):Unit={
+        ptr(m.io.commit.bits,id);m.io.measureActive.poke(true.B)
+        m.io.commit.valid.poke(true.B);tick();m.io.commit.valid.poke(false.B)
+        m.io.measureActive.poke(false.B)
       }
-      println("HINT_REDIRECT_SIX_ORDERING_AND_LATE_RESOLVE_PASS")
-      // At the same position inclusive becomes stronger and cannot later weaken.
-      reset(profile=true); val equal=query(); resolve()
-      redirect(equal,0x1000,false); event(true)
-      redirect(equal,0x1000,true); event(false)
-      redirect(equal,0x1000,false); resolve(); event(false)
-      // A smaller exclusive cutoff is stronger than a larger inclusive cutoff.
-      reset(profile=true); val smaller=query(); resolve()
-      redirect(smaller,0x1002,true); redirect(smaller,0x1000,false); event(true)
-      println("HINT_REDIRECT_PERSISTENT_INCLUSIVE_MERGE_PASS")
-      // Exact backend redirect cycle: replace a younger resolved event with an earlier survivor.
-      reset(profile=true); val replacement=query(); resolve()
-      setResolve(0xffc); setRedirect(replacement,0xffe,true); tick()
-      m.io.redirect.valid.poke(false.B); m.io.resolve(0).valid.poke(false.B)
-      event(true,0xffc)
-      // Equal-position simultaneous resolve under flushSelf must never become resolved.
-      reset(profile=true); val concurrent=query(); setResolve(0x1000)
-      setRedirect(concurrent,0x1000,true); tick()
-      m.io.redirect.valid.poke(false.B); m.io.resolve(0).valid.poke(false.B)
-      event(false); resolve(); event(false)
-      println("HINT_REDIRECT_SAME_CYCLE_EARLIER_REPLACEMENT_PASS")
-      def confirm(): Unit = {
-        m.io.s3UsedHint.poke(true.B); m.io.s3Fire.poke(true.B); tick()
-        m.io.s3Fire.poke(false.B); m.io.s3UsedHint.poke(false.B)
+      // All six flush outcomes are tested on real metadata and commit-only FIFO.
+      for(self<-Seq(false,true);cutoff<-Seq(0xffe,0x1000,0x1002)){
+        reset(profile=false,hardware=true);val saved=query();confirm();resolve();tick(4)
+        m.io.stats.confAccepted.expect(0.U);m.io.stats.confApply.expect(0.U)
+        redirect(saved,cutoff,self);tick(4)
+        val survives=cutoff>0x1000 || cutoff==0x1000 && !self
+        if(survives){commit();tick(12);m.io.stats.confApply.expect(1.U)}
+        else{resolve();tick(12);m.io.stats.confApply.expect(0.U)}
+        m.io.stats.confUndo.expect(0.U);m.io.stats.confCanceled.expect(0.U)
+        query(11);m.io.s3Lookup.contextHit.expect(true.B)
+        m.io.s3Lookup.usable.expect((!survives).B)
       }
-      // Actual finite confidence SRAM: 1 -> 0 wrong resolve, inclusive undo -> 1.
-      reset(profile=false,hardware=true); val applied=query(); confirm(); resolve(); tick(5)
-      m.io.stats.confApply.expect(1.U)
-      query(11); m.io.s3Lookup.contextHit.expect(true.B); m.io.s3Lookup.usable.expect(false.B)
-      // Exclusive first trigger, immediately strengthened while rollback is active.
-      redirect(applied,0x1000,false); redirect(applied,0x1000,true); tick(8)
-      m.io.stats.confUndo.expect(1.U); query(11); m.io.s3Lookup.usable.expect(true.B)
-      val accepted=m.io.stats.confAccepted.peek().litValue
-      resolve(); tick(5); m.io.stats.confAccepted.expect(accepted.U)
-      println("HINT_REDIRECT_CONFIDENCE_EQUAL_STRENGTH_UNDO_PASS")
-      // A genuinely earlier record and its applied update survive flushSelf at a later PC.
-      reset(profile=false,hardware=true); val earlier=query(); confirm(); resolve(); tick(5)
-      redirect(earlier,0x1002,true); tick(8); m.io.stats.confUndo.expect(0.U)
-      query(11); m.io.s3Lookup.usable.expect(false.B)
-      println("HINT_REDIRECT_ACTUAL_EARLIER_SURVIVOR_PASS")
+      println("HINT_REDIRECT_SIX_ORDERING_COMMIT_ONLY_PASS no_wrong_path_training=1 no_undo=1")
+      // Equal inclusive same-edge resolve never qualifies a later commit.
+      reset(profile=false,hardware=true);val concurrent=query();confirm();setResolve(0x1000)
+      m.io.measureActive.poke(true.B);setRedirect(concurrent,0x1000,true);tick()
+      m.io.redirect.valid.poke(false.B);m.io.resolve(0).valid.poke(false.B)
+      m.io.measureActive.poke(false.B);tick(12)
+      m.io.stats.confAccepted.expect(0.U);m.io.stats.confApply.expect(0.U)
+      query(11);m.io.s3Lookup.usable.expect(true.B)
+      println("HINT_REDIRECT_CONCURRENT_KILL_COMMIT_ONLY_PASS")
       println(s"HINT_REDIRECT_LEVEL_REAL_RTL_PASS checks=$checks forced_state=0")
     }
   }

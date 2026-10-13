@@ -35,6 +35,15 @@ class HintObserverLinkPreflight extends Module {
   observer.io.pending := io.input
   observer.io.outstanding := 0.U
   observer.io.meta := 0.U
+  val traceObserver=Module(new HintTraceDpi)
+  traceObserver.io.clock := clock
+  traceObserver.io.valid := false.B
+  traceObserver.io.data := io.input
+  traceObserver.io.discovery := false.B
+  traceObserver.io.ftqTag := 0.U
+  traceObserver.io.queryCycle := 0.U
+  traceObserver.io.overflow := false.B
+  traceObserver.io.occupancy := 0.U
 }
 
 class HintTest extends AnyFlatSpec with ChiselSim {
@@ -102,17 +111,16 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         p.flag.poke(((id / 64) % 2 != 0).B); p.value.poke((id % 64).U)
       }
       def tick(n: Int = 1): Unit = for (_ <- 0 until n) {
-        m.io.canAccept.expect(true.B); m.io.confDropped.expect(0.U)
+        m.io.canAccept.expect(true.B)
         val h = m.io.debugConfHead.get.peek().litValue
         val t = m.io.debugConfTail.get.peek().litValue
-        val w = m.io.debugConfWrite.get.peek().litValue
-        assert((t-h+64)%64 <= 32 && (t-w+64)%64 <= (t-h+64)%64)
+        val occupancy = (t-h+32)%32
+        assert(occupancy <= 16, s"FIFO capacity exceeded: $occupancy")
         val accepted = m.io.stats.confAccepted.peek().litValue
         val retired = m.io.stats.confRetired.peek().litValue
-        val canceled = m.io.stats.confCanceled.peek().litValue
-        val undone = m.io.stats.confUndo.peek().litValue
-        assert(accepted == retired + canceled + undone + (t-h+64)%64,
-          s"accepted=$accepted retired=$retired canceled=$canceled undo=$undone occupancy=${(t-h+64)%64}")
+        m.io.stats.confUndo.expect(0.U);m.io.stats.confCanceled.expect(0.U)
+        assert(accepted == retired + occupancy,
+          s"accepted=$accepted retired=$retired occupancy=$occupancy")
         checks += 1; m.clock.step()
       }
       def prediction(p: xiangshan.frontend.bpu.Prediction, taken: Boolean, target: Int,
@@ -131,7 +139,7 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         m.io.measureActive.poke(false.B); m.io.s1Fire.poke(false.B); m.io.s2Fire.poke(false.B)
         m.io.s3Fire.poke(false.B); m.io.s3Override.poke(false.B); m.io.s3UsedHint.poke(false.B)
         m.io.s3BaselineTarget.poke(0x3000.U); m.io.redirect.valid.poke(false.B)
-        m.io.commit.valid.poke(false.B); for(r<-m.io.resolve) { r.valid.poke(false.B); r.bits.offset.poke(0.U); r.bits.mispredict.poke(false.B); r.bits.sourceBackend.poke(true.B) }
+        m.io.commit.valid.poke(false.B);m.io.traceCommit.valid.poke(false.B); for(r<-m.io.resolve) { r.valid.poke(false.B); r.bits.offset.poke(0.U); r.bits.mispredict.poke(false.B); r.bits.sourceBackend.poke(true.B) }
         input(0x1000,0,0x2000,false)
         m.reset.poke(true.B); m.clock.step(3); m.reset.poke(false.B)
         recent=Vector.fill(16)(Vector.fill(4)(0)); heads=Vector.fill(16)(0)
@@ -194,7 +202,11 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         m.io.s3Fire.poke(true.B);tick();m.io.s3Fire.poke(false.B);m.io.s3UsedHint.poke(false.B)
       }
       // Commit denotes the already fully retired FTQ reclamation watermark.
-      def commit(id:Int): Unit = {ptr(m.io.commit.bits,id);m.io.commit.valid.poke(true.B);tick();m.io.commit.valid.poke(false.B)}
+      def commit(id:Int,measure:Boolean=true): Unit = {
+        ptr(m.io.commit.bits,id);m.io.measureActive.poke(measure.B)
+        m.io.commit.valid.poke(true.B);tick();m.io.commit.valid.poke(false.B)
+        m.io.measureActive.poke(false.B)
+      }
       def resolve(id:Int,actual:Int,measure:Boolean=true): Unit = {
         val r=m.io.resolve(0);r.valid.poke(true.B);ptr(r.bits.ftqPtr,id)
         r.bits.cfiPc.poke(0x1000.U);r.bits.target.poke(actual.U);r.bits.eligible.poke(true.B)
@@ -221,119 +233,14 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       reset();load(0,0,BigInt(0));m.io.tableReady.expect(true.B)
       println("HINT_SRAM_CLEAR_ONLY_REAL_DONE_PASS old_done_edge_rejected=1 real_sram_reset_complete=1")
 
-      // Actual same-FTQ positional counterexample: redirect retains FTQ 10
-      // at its earlier ordinary branch (0xffe), so H2P 0x1000 must be killed.
+      // Resolve-only and wrong-path records never reach the committed FIFO.
       reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      val sameFtqLater=query(0x1000,10,start=0xfe0);confirm()
-      resolve(10,0x2000);tick(5);m.io.stats.confApply.expect(1.U)
-      restore(sameFtqLater,11,0xffe,0x4000,reapply=true,kind=1)
-      tick(8);m.io.stats.confUndo.expect(1.U);confProbe(11,1)
-      println("HINT_SAME_FTQ_EARLIER_REAPPLY_APPLIED_UNDO_PASS")
-
-      // The same positional boundary must cancel an accepted, unapplied log
-      // item while a genuinely older FTQ retires on the redirect cycle.
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      query(0x1000,9);confirm();resolve(9,0x2000);tick(4)
-      val pendingSame=query(0x1000,10,start=0xfe0);confirm();resolve(10,0x3000)
-      tick();m.io.stats.confAccepted.expect(2.U);m.io.stats.confApply.expect(1.U)
-      ptr(m.io.commit.bits,9);m.io.commit.valid.poke(true.B)
-      val pendingAgain=m.io.resolve(0);pendingAgain.valid.poke(true.B)
-      ptr(pendingAgain.bits.ftqPtr,10);pendingAgain.bits.cfiPc.poke(0x1000.U)
-      pendingAgain.bits.target.poke(0x3000.U);pendingAgain.bits.eligible.poke(true.B)
-      m.io.measureActive.poke(true.B)
-      restore(pendingSame,11,0xffe,0x4000,reapply=true,kind=1)
-      pendingAgain.valid.poke(false.B);m.io.commit.valid.poke(false.B)
-      m.io.measureActive.poke(false.B);tick(8);confProbe(11,2)
-      m.io.stats.confCanceled.expect(1.U);m.io.stats.confUndo.expect(0.U)
-      m.io.stats.confRetired.expect(1.U);m.io.stats.confAccepted.expect(2.U)
-      println("HINT_SAME_FTQ_EARLIER_REAPPLY_UNAPPLIED_CANCEL_PASS")
-
-      // Equal-position reapply preserves the branch; a nested earlier cutoff
-      // subsequently kills that same record and its applied confidence log.
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      val nestedSame=query(0x1000,20,start=0xfe0);confirm()
-      resolve(20,0x2000);tick(5)
-      restore(nestedSame,21,0x1000,0x2000,reapply=true);tick(4)
-      m.io.stats.confUndo.expect(0.U)
-      restore(nestedSame,21,0xffe,0x4000,reapply=true,kind=1);tick(8)
-      m.io.stats.confUndo.expect(1.U);confProbe(21,1)
-      // Late resolve from the killed CFI cannot allocate a new update.
-      val acceptedAfterKill=m.io.stats.confAccepted.peek().litValue
-      resolve(20,0x2000);tick(5)
-      m.io.stats.confAccepted.expect(acceptedAfterKill.U)
-      println("HINT_SAME_FTQ_NESTED_CUTOFF_LATE_RESOLVE_PASS")
-
-      // Resolve on the kill cycle has lower priority than the earlier CFI.
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      val unresolvedSame=query(0x1000,30,start=0xfe0);confirm()
-      val killedResolve=m.io.resolve(0);killedResolve.valid.poke(true.B)
-      ptr(killedResolve.bits.ftqPtr,30);killedResolve.bits.cfiPc.poke(0x1000.U)
-      killedResolve.bits.target.poke(0x2000.U);killedResolve.bits.eligible.poke(true.B)
-      m.io.measureActive.poke(true.B)
-      restore(unresolvedSame,31,0xffe,0x4000,reapply=true,kind=1)
-      killedResolve.valid.poke(false.B);m.io.measureActive.poke(false.B);tick(6)
+      val killed=query(0x1000,10,start=0xfe0);confirm();resolve(10,0x2000);tick(8)
       m.io.stats.confAccepted.expect(0.U);m.io.stats.confApply.expect(0.U)
-      resolve(30,0x2000);tick(5);m.io.stats.confAccepted.expect(0.U)
-      println("HINT_SAME_FTQ_KILL_PRIORITY_UNRESOLVED_PASS")
-
-      def expectProfileCommit(id:Int,valid:Boolean,actual:Int=0x2000):Unit={
-        ptr(m.io.commit.bits,id);m.io.commit.valid.poke(true.B)
-        m.io.profileEvent.valid.expect(valid.B)
-        if(valid){m.io.profileEvent.bits.pc.expect(0x1000.U)
-          m.io.profileEvent.bits.actual.expect(actual.U)
-          m.io.profileEvent.bits.ftqTag.expect((id%128).U)}
-        // A killed FTQ is never legally reclaimed as a retired branch. Probe
-        // its combinational event suppression without clocking fake commit.
-        if(valid)tick()
-        m.io.commit.valid.poke(false.B)
-      }
-      // These observe the actual production profileRows/profileEvent registers.
-      reset();cam(0,0x1000,0);m.io.profile.poke(true.B)
-      val profileKilled=query(0x1000,40,start=0xfe0);resolve(40,0x2000)
-      restore(profileKilled,41,0xffe,0x4000,reapply=true,kind=1);tick(3)
-      expectProfileCommit(40,false)
-      resolve(40,0x2000);tick(2);expectProfileCommit(40,false)
-
-      reset();cam(0,0x1000,0);m.io.profile.poke(true.B)
-      val profileNested=query(0x1000,42,start=0xfe0);resolve(42,0x2000)
-      restore(profileNested,43,0x1002,0x4000,reapply=true,kind=1);tick(2)
-      restore(profileNested,43,0xffe,0x4000,reapply=true,kind=1);tick(2)
-      expectProfileCommit(42,false)
-
-      reset();cam(0,0x1000,0);m.io.profile.poke(true.B)
-      val profileEqual=query(0x1000,44,start=0xfe0);resolve(44,0x2000)
-      restore(profileEqual,45,0x1000,0x2000,reapply=true);tick(2)
-      expectProfileCommit(44,true)
-
-      reset();cam(0,0x1000,0);m.io.profile.poke(true.B)
-      val profileDead=query(0x1000,46,start=0xfe0)
-      restore(profileDead,46,0xffe,0x4000,reapply=false,kind=1);tick(2)
-      resolve(46,0x2000);tick(2);expectProfileCommit(46,false)
-      query(0x1000,110,start=0xfe0)
-      resolve(46,0x3000);tick(2)
-      // Combinational observation only: do not retire an unresolved H2P.
-      ptr(m.io.commit.bits,110);m.io.commit.valid.poke(true.B)
-      m.io.profileEvent.valid.expect(false.B);m.io.commit.valid.poke(false.B)
-      // The live new flag-generation emits only its own resolved target.
-      resolve(110,0x2006);tick(2)
-      expectProfileCommit(110,true,0x2006)
-      // A surviving earlier backend resolve on the exact S3 override cycle
-      // replaces an already-resolved later event in this same live FTQ.
-      reset();cam(0,0x1000,0);m.io.profile.poke(true.B)
-      query(0x1000,50,start=0xfe0);resolve(50,0x2000)
-      input(0xffe,50,0x3004,true,start=0xfe0)
-      m.io.s3Override.poke(true.B)
-      val s3Replacing=m.io.resolve(0);s3Replacing.valid.poke(true.B)
-      ptr(s3Replacing.bits.ftqPtr,50);s3Replacing.bits.cfiPc.poke(0xffe.U)
-      s3Replacing.bits.target.poke(0x3004.U);s3Replacing.bits.eligible.poke(true.B)
-      s3Replacing.bits.sourceBackend.poke(true.B);s3Replacing.bits.offset.poke(15.U)
-      s3Replacing.bits.baselinePc.poke(0xffe.U);s3Replacing.bits.blockStart.poke(0xfe0.U)
-      tick();m.io.s3Override.poke(false.B);s3Replacing.valid.poke(false.B);tick(2)
-      ptr(m.io.commit.bits,50);m.io.commit.valid.poke(true.B)
-      m.io.profileEvent.valid.expect(true.B);m.io.profileEvent.bits.pc.expect(0xffe.U)
-      m.io.profileEvent.bits.actual.expect(0x3004.U);tick();m.io.commit.valid.poke(false.B)
-      println("HINT_PROFILE_S3_SAME_CYCLE_EARLIER_SURVIVOR_PASS")
-      println("HINT_PROFILE_REAL_LIVE_CUTOFF_NEW_GENERATION_PASS")
+      restore(killed,11,0xffe,0x4000,reapply=true,kind=1);tick(6)
+      resolve(10,0x2000);tick(4);confProbe(11,1)
+      m.io.stats.confAccepted.expect(0.U);m.io.stats.confUndo.expect(0.U)
+      println("HINT_CONF16_COMMIT_ONLY_KILL_PASS")
 
       for(mask<-Seq(2,0)){
         reset();for(i<-0 until 16)cam(i,pcs(i),mask);m.io.enabled.poke(true.B)
@@ -377,110 +284,70 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       query(0x1000,17);m.io.s3Lookup.usable.expect(true.B);confirm();m.io.stats.recordAllocate.expect(17.U)
       println("HINT_CONTINUOUS_METADATA_PASS capacity=16 normal_s1_blocked=0")
 
+      // Same-address RMW uses the actual SRAM value, not a stale prediction.
+      reset();cam(0,0x1000,0);context(3);m.io.enabled.poke(true.B)
+      var logicalConf=3
+      for((correct,i)<-Vector(false,false,false,true,true,true,true,false).zipWithIndex){
+        confProbe(i,logicalConf);confirm();resolve(i,if(correct)0x2000 else 0x3000)
+        m.io.stats.confAccepted.expect(i.U) // Resolve did not enqueue.
+        commit(i);tick(12)
+        logicalConf=if(correct)math.min(3,logicalConf+1)else math.max(0,logicalConf-1)
+        confProbe(i+40,logicalConf)
+      }
+      m.io.stats.confApply.expect(8.U)
+      println("HINT_CONF16_SERIAL_SATURATION_PASS sequence=3,2,1,0,1,2,3,3,2")
+
+      // A qualified backend resolve and FTQ commit on one edge train exactly once.
+      // IFU/noneligible resolves must skip and release the candidate metadata.
+      for((backend,eligible,expected)<-Seq((true,true,1),(false,true,0),(true,false,0))){
+        reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
+        query(0x1000,0);confirm()
+        val r=m.io.resolve(0);r.valid.poke(true.B);ptr(r.bits.ftqPtr,0)
+        r.bits.cfiPc.poke(0x1000.U);r.bits.target.poke(0x2000.U)
+        r.bits.eligible.poke(eligible.B);r.bits.sourceBackend.poke(backend.B)
+        r.bits.baselinePc.poke(0x1000.U);r.bits.baselineTarget.poke(0x3000.U)
+        r.bits.baselineValid.poke(true.B);r.bits.blockStart.poke(0x1000.U)
+        commit(0);r.valid.poke(false.B);tick(12)
+        m.io.stats.confAccepted.expect(expected.U);m.io.stats.confApply.expect(expected.U)
+        confProbe(1,1+expected)
+      }
+      println("HINT_CONF16_QUALIFIED_SAMEEDGE_COMMIT_PASS backend=1 ifu_skipped=1 noneligible_skipped=1")
+
+      // Warmup/restore resolve or commit cannot qualify a training event.
+      for((resolveMeasure,commitMeasure)<-Seq((false,true),(true,false),(false,false))){
+        reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
+        query(0x1000,0);confirm();resolve(0,0x3000,resolveMeasure);commit(0,commitMeasure);tick(12)
+        m.io.stats.confAccepted.expect(0.U);m.io.stats.confApply.expect(0.U);confProbe(1,1)
+      }
+      println("HINT_CONF16_PHASE_QUALIFICATION_PASS")
+
+      // A stalled prediction owns its raw SRAM conf even after training changes it.
       reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      var logicalConf=1
-      for(i<-0 until 130){
+      query(0x1000,0);confirm();resolve(0,0x3000)
+      val before=recent;val beforeHeads=heads
+      input(0x1000,1,0x2000,true)
+      m.io.s1Fire.poke(true.B);tick();m.io.s1Fire.poke(false.B);localWrite(0x1000,0x2000)
+      commit(0);tick(12) // train read/write occurs while S2 is held.
+      m.io.stats.confApply.expect(1.U)
+      m.io.s2Fire.poke(true.B);tick();m.io.s2Fire.poke(false.B)
+      expectSnapshot(before,beforeHeads)
+      m.io.debugSelectedConf.get.expect(1.U);m.io.s3Lookup.usable.expect(true.B)
+      // A later S1 sees the newly written zero; correct shadow target can recover it.
+      confirm();commit(1,measure=false);tick(4)
+      confProbe(2,0);confirm();resolve(2,0x2000);commit(2);tick(12);confProbe(3,1)
+      println("HINT_CONF16_RAW_STALLED_PREDICTION_PASS old_query=1 new_query=0 conf0_recovered=1")
+
+      // At least two complete FIFO pointer wraps with real sequential SRAM RMW.
+      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
+      logicalConf=1
+      for(i<-0 until 70){
         confProbe(i,logicalConf);confirm();val correct=i%7!=0
-        resolve(i,if(correct)0x2000 else 0x3000);commit(i);tick(5)
+        resolve(i,if(correct)0x2000 else 0x3000);commit(i);tick(12)
         logicalConf=if(correct)math.min(3,logicalConf+1)else math.max(0,logicalConf-1)
       }
-      confProbe(130,logicalConf);m.io.stats.confApply.expect(130.U)
+      confProbe(71,logicalConf);m.io.stats.confApply.expect(70.U)
       assert(m.io.debugConfHead.get.peek().litValue==m.io.debugConfTail.get.peek().litValue)
-      confirm();resolve(130,0x3000,measure=false);commit(130);tick(5)
-      confProbe(131,logicalConf);m.io.stats.confApply.expect(130.U)
-      println("HINT_CONTINUOUS_WRAP_PASS applied=130 warmup_no_training=1")
-
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      confProbe(0,1);confirm();confProbe(1,1);confirm()
-      resolve(1,0x2000);tick(3);m.io.stats.confApply.expect(0.U)
-      resolve(0,0x3000);tick(5);m.io.debugSelectedConf.get.expect(1.U);m.io.stats.confApply.expect(2.U)
-      commit(0);commit(1);tick(5);m.io.debugSelectedConf.get.expect(1.U);confProbe(2,1)
-
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      confProbe(0,1);confirm();resolve(0,0x3000);commit(0);tick(6)
-      m.io.debugSelectedConf.get.expect(0.U);m.io.s3Lookup.usable.expect(false.B)
-      confProbe(1,0);confirm();resolve(1,0x2000);commit(1);tick(6);m.io.debugSelectedConf.get.expect(1.U)
-      println("HINT_CONTINUOUS_BROADCAST_PASS conf0_rise=1 stalled_row_retired_log=1")
-
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      confProbe(0,1);confirm();resolve(0,0x3000)
-      // Every cycle issues S1, unlike query()'s two-cycle staged driver.
-      for(i<-1 to 12){
-        input(0x1000,i,0x2000,true)
-        m.io.s1Fire.poke(true.B);m.io.s2Fire.poke(true.B)
-        tick();localWrite(0x1000,0x2000)
-      }
-      m.io.s1Fire.poke(false.B);m.io.s2Fire.poke(false.B)
-      m.io.stats.confApply.expect(0.U) // A pending confidence write cannot steal any S1 read.
-      assert(m.io.debugConfTail.get.peek().litValue!=m.io.debugConfWrite.get.peek().litValue)
-      confProbe(13,0)
-      m.io.stats.confApply.expect(1.U);m.io.debugSelectedConf.get.expect(0.U)
-      m.io.stats.lookupPortFallback.expect(0.U)
-
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      var saved11:Option[Saved]=None;var saved12:Option[Saved]=None
-      for(i<-10 to 12){
-        val s=query(0x1000,i);if(i==11)saved11=Some(s);if(i==12)saved12=Some(s)
-        confirm();resolve(i,if(i==11)0x2000 else 0x3000);tick(4)
-      }
-      m.io.stats.confApply.expect(3.U)
-      restore(saved12.get,12,0x1800,0x4000,reapply=false,taken=false,kind=1)
-      restore(saved11.get,11,0x1800,0x4000,reapply=false,taken=false,kind=1)
-      tick(8);confProbe(13,0);m.io.stats.confUndo.expect(2.U);commit(10);tick(6)
-      println("HINT_CONTINUOUS_NESTED_ROLLBACK_PASS undo=2 oldest_preserved=1")
-
-      // S3 override and S3 record allocation in the same cycle retain the current branch.
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      val own=query(0x1000,20,0x3000)
-      prediction(m.io.s3Prediction,true,0x2000);m.io.s3Override.poke(true.B)
-      confirm();m.io.s3Override.poke(false.B)
-      recent=own.values;heads=own.pointers;localWrite(0x1000,0x2000)
-      m.io.stats.recordAllocate.expect(1.U)
-      resolve(20,0x2000);commit(20);tick(5);confProbe(21,2)
-      m.io.stats.confUndo.expect(0.U)
-      // Earlier non-H2P CFI in this same FTQ kills the later speculative H2P; no illegal commit.
-      val later=query(0x1000,22);confirm()
-      restore(later,22,0x1800,0x4000,reapply=false,taken=false,kind=1);tick(5)
-      resolve(22,0x3000);tick(5);confProbe(23,2)
-      m.io.stats.confApply.expect(1.U)
-      m.io.stats.metaStall.expect(0.U);m.io.stats.lhrStall.expect(0.U)
-      // Cancel an accepted but unapplied younger suffix. Older commit is legal
-      // on the redirect cycle; committing the killed younger FTQ would not be.
-      reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-      query(0x1000,20);confirm();resolve(20,0x2000);tick(4)
-      val pendingYoung=query(0x1000,21);confirm();resolve(21,0x3000)
-      tick() // enqueue the young update, but do not give it an apply cycle
-      m.io.stats.confAccepted.expect(2.U);m.io.stats.confApply.expect(1.U)
-      ptr(m.io.commit.bits,20);m.io.commit.valid.poke(true.B)
-      val concurrent=m.io.resolve(0);concurrent.valid.poke(true.B);ptr(concurrent.bits.ftqPtr,21)
-      concurrent.bits.cfiPc.poke(0x1000.U);concurrent.bits.target.poke(0x3000.U)
-      concurrent.bits.eligible.poke(true.B);m.io.measureActive.poke(true.B)
-      restore(pendingYoung,21,0x1800,0x4000,reapply=false,taken=false,kind=1)
-      concurrent.valid.poke(false.B);m.io.commit.valid.poke(false.B);m.io.measureActive.poke(false.B)
-      tick(8);confProbe(22,2)
-      m.io.stats.confAccepted.expect(2.U);m.io.stats.confApply.expect(1.U)
-      m.io.stats.confCanceled.expect(1.U);m.io.stats.confUndo.expect(0.U);m.io.stats.confRetired.expect(1.U)
-      println("HINT_CONTINUOUS_UNAPPLIED_CANCEL_PASS legal_old_commit_young_resolve_redirect=1")
-
-      // Cache raw confidence in S2, then update/retire the log before S2 moves.
-      // Repeat with apply exactly on the stage-transfer cycle.
-      for(transferWithApply<-Seq(false,true)){
-        reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
-        query(0x1000,0);confirm();resolve(0,0x3000)
-        val before=recent;val beforeHeads=heads
-        input(0x1000,1,0x2000,true)
-        m.io.s1Fire.poke(true.B);tick();m.io.s1Fire.poke(false.B);localWrite(0x1000,0x2000)
-        // S2 holds the raw row read while enqueue occurred, before apply.
-        m.io.stats.confAccepted.expect(1.U);m.io.stats.confApply.expect(0.U)
-        if(transferWithApply)m.io.s2Fire.poke(true.B)
-        tick();m.io.s2Fire.poke(false.B)
-        commit(0);tick(5)
-        if(!transferWithApply){m.io.s2Fire.poke(true.B);tick();m.io.s2Fire.poke(false.B)}
-        expectSnapshot(before,beforeHeads)
-        m.io.debugSelectedConf.get.expect(0.U);m.io.s3Lookup.usable.expect(false.B)
-        assert(m.io.debugConfHead.get.peek().litValue==m.io.debugConfTail.get.peek().litValue)
-      }
-      println("HINT_CONTINUOUS_S2_BROADCAST_PASS stalled_retired_log=1 apply_samecycle_transfer=1")
+      println("HINT_CONF16_WRAP_PASS events=70")
 
       // Back-to-back independent set/way/slot identities expose a one-stage
       // alignment mistake that repeated-PC tests cannot detect. Empty Context
@@ -519,11 +386,11 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       println("HINT_SRAM_PIPELINE_IDENTITY_PASS independent_sets=2 independent_ways=2 stale_slot_miss_rejected=1 back_to_back=1")
 
       // A real continuous S1/S2/S3 stream starves physical writes until the
-      // 32-entry confidence log fills. Full means Hint fallback, never a stalled
-      // ordinary S1. Those idle Hint-port cycles must make write/retire progress.
+      // 16-entry commit FIFO fills. Full drops training, never a stalled
+      // ordinary S1 and never a Hint lookup fallback.
       reset();cam(0,0x1000,0);context(1);m.io.enabled.poke(true.B)
       m.io.measureActive.poke(true.B)
-      var maxOutstanding=BigInt(0);var maxPending=BigInt(0)
+      var maxOutstanding=BigInt(0)
       val streamLength=120
       for(cycle<-0 until streamLength+48){
         val querying=cycle<streamLength
@@ -546,25 +413,27 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         if(retiringId>=0 && retiringId<streamLength)ptr(m.io.commit.bits,retiringId)
         val h=m.io.debugConfHead.get.peek().litValue
         val t=m.io.debugConfTail.get.peek().litValue
-        val w=m.io.debugConfWrite.get.peek().litValue
-        maxOutstanding=maxOutstanding.max((t-h+64)%64)
-        maxPending=maxPending.max((t-w+64)%64)
+        maxOutstanding=maxOutstanding.max((t-h+32)%32)
         tick();if(querying)localWrite(0x1000,0x2000)
       }
       m.io.s1Fire.poke(false.B);m.io.s2Fire.poke(false.B);m.io.s3Fire.poke(false.B)
       m.io.s3UsedHint.poke(false.B);m.io.resolve(0).valid.poke(false.B)
-      m.io.commit.valid.poke(false.B);m.io.measureActive.poke(false.B);tick(8)
-      assert(maxPending>1,s"did not exercise a genuine write backlog: $maxPending")
-      assert(maxOutstanding==32,s"did not exercise full confidence capacity: $maxOutstanding")
+      m.io.commit.valid.poke(false.B);m.io.measureActive.poke(false.B)
+      var drainCycles=0
+      while(m.io.debugConfHead.get.peek().litValue!=m.io.debugConfTail.get.peek().litValue && drainCycles<128){
+        tick();drainCycles+=1
+      }
+      assert(drainCycles<128,"finite RMW FIFO failed to drain without prediction reads")
+      assert(maxOutstanding==16,s"did not exercise full FIFO capacity: $maxOutstanding")
       val acceptedStream=m.io.stats.confAccepted.peek().litValue
-      assert(acceptedStream>32,s"Hint did not resume after capacity fallback: $acceptedStream")
+      val drops=m.io.stats.confDropped.peek().litValue
+      assert(drops>0,s"full FIFO did not drop training: $drops")
       m.io.stats.confRetired.expect(acceptedStream.U)
       m.io.stats.confApply.expect(acceptedStream.U)
+      m.io.stats.lookupPortFallback.expect(0.U)
       assert(m.io.debugConfHead.get.peek().litValue==m.io.debugConfTail.get.peek().litValue)
-      assert(m.io.debugConfWrite.get.peek().litValue==m.io.debugConfTail.get.peek().litValue)
-      assert(m.io.stats.lookupPortFallback.peek().litValue>0,"full log must fall back")
       confProbe(121,3)
-      println(s"HINT_SRAM_CONF_FULL_PROGRESS_PASS maxOutstanding=$maxOutstanding maxPending=$maxPending accepted=$acceptedStream ordinary_s1_always_ready=1")
+      println(s"HINT_CONF16_FULL_DROP_PASS maxOutstanding=$maxOutstanding accepted=$acceptedStream dropped=$drops ordinary_s1_always_ready=1 hint_read_continues=1")
 
       // Shared nonzero component goldens are expanded to all sixteen masks by
       // the separately frozen Python hash contract. Actual RTL histories are
@@ -591,6 +460,39 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         seed(hex(sample,"ith_low64"),32){cell=>emitHistory(BigInt(0x2000),cell,3,0)}
         seed(hex(sample,"call_low64"),32){cell=>emitHistory(BigInt(cell<<1),0,2,2)}
         seed(hex(sample,"ret_low64"),32){cell=>emitHistory(BigInt(cell<<1),0,3,1)}
+        // Exact FTQ snapshot-to-commit fold: no whole-history profile shadow.
+        m.io.s1StartPc.poke(pc.U);m.io.s1CfiPc.poke(pc.U);ptr(m.io.s1Ptr,0)
+        prediction(m.io.s1Prediction,false,0x2000)
+        m.io.s1Fire.poke(true.B);tick();m.io.s1Fire.poke(false.B)
+        m.io.s2Fire.poke(true.B);tick();m.io.s2Fire.poke(false.B)
+        val commitSnapshot=copies(m.io.s3Snapshot,m.io.traceCommit.bits.snapshot)
+        val restoreSnapshot=copies(m.io.s3Snapshot,m.io.redirect.bits.meta.hint)
+        commitSnapshot.foreach(_())
+        m.io.traceCommit.bits.actualPc.poke(pc.U);m.io.traceCommit.bits.actualTarget.poke(0x2000.U)
+        m.io.traceCommit.bits.queryStartPc.poke(pc.U);m.io.traceCommit.bits.eligible.poke(true.B)
+        m.io.traceCommit.bits.queryValid.poke(true.B);m.io.traceCommit.bits.baselineMiss.poke(true.B)
+        m.io.traceCommit.bits.pcId.poke(0.U);m.io.traceCommit.bits.ftqTag.poke(0.U)
+        m.io.traceCommit.bits.queryCycle.foreach(_.poke(0.U))
+        m.io.traceCommit.valid.poke(true.B)
+        def expectFold():Unit={
+          val cs=(sample \ "components").children.map(v=>BigInt(v.extract[String].stripPrefix("0x"),16))
+          m.io.profileEvent.valid.expect(true.B);m.io.profileEvent.bits.queryValid.expect(true.B)
+          m.io.profileEvent.bits.ith.expect(cs(0).U);m.io.profileEvent.bits.lhr.expect(cs(1).U)
+          m.io.profileEvent.bits.call.expect(cs(2).U);m.io.profileEvent.bits.ret.expect(cs(3).U)
+        }
+        expectFold();m.io.traceCommit.valid.poke(false.B)
+        // A fifth same-PC LHR write and compressed Call/Ret rewrite cannot
+        // change the old snapshot. Global ITH advances to exactly the 96-cell limit.
+        for(i<-0 until 5)emitHistory(pc,(i+1)&3,3,0)
+        for(i<-0 until 91)emitHistory(BigInt(0x2000),(i*3)&3,3,0)
+        emitHistory(BigInt(0x135a),0,2,2);emitHistory(BigInt(0x246c),0,3,1)
+        m.io.traceCommit.valid.poke(true.B);expectFold();m.io.traceCommit.valid.poke(false.B)
+        restoreSnapshot.foreach(_());ptr(m.io.redirect.bits.newFtqIdx,0)
+        m.io.redirect.bits.cfiPc.addr.poke(((pc>>1)&((BigInt(1)<<47)-1)).U);m.io.redirect.bits.target.addr.poke(0x1000.U)
+        m.io.redirect.bits.taken.poke(false.B);m.io.redirect.bits.attribute.branchType.poke(1.U)
+        m.io.redirect.bits.attribute.rasAction.poke(0.U);m.io.redirect.bits.reapply.poke(false.B)
+        m.io.redirect.valid.poke(true.B);tick();m.io.redirect.valid.poke(false.B)
+        println("HINT_TRACE_FTQ_SNAPSHOT_FOLD_PASS ith96=1 lhr_fifth=1 call_low12_patch=1 ret_low12_patch=1 full_history_shadow=0")
         m.io.profile.poke(false.B)
         for(v<-vs.sortBy(x=>(x \ "mask").extract[Int])){
           m.io.enabled.poke(false.B)
@@ -624,9 +526,10 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       def tick():Unit={
         // Both logical operations must be excluded at the public hardware ports.
         val readFire=m.io.read.valid.peek().litToBoolean && m.io.read.ready.peek().litToBoolean
+        val trainFire=m.io.trainRead.valid.peek().litToBoolean && m.io.trainRead.ready.peek().litToBoolean
         val loadFire=m.io.load.valid.peek().litToBoolean && m.io.load.ready.peek().litToBoolean
         val writeFire=m.io.writeConf.valid.peek().litToBoolean && m.io.writeConf.ready.peek().litToBoolean
-        assert(!(readFire && (loadFire || writeFire)),"Context logical read/write conflict")
+        assert(Seq(readFire,trainFire,loadFire,writeFire).count(identity)<=1,"Context logical operation conflict")
         assert(!(loadFire && writeFire),"loader and dynamic conf write conflict")
         portChecks+=1;m.clock.step()
       }
@@ -639,6 +542,7 @@ class HintTest extends AnyFlatSpec with ChiselSim {
         (BigInt(1)<<24)|(BigInt(conf)<<22)|(BigInt((set*3+way)&31)<<17)|BigInt(0x100+set*2+way)
       var expected=Vector.tabulate(8,2)((set,way)=>row(set,way,(set+way)&3))
       m.io.clear.poke(false.B);m.io.read.valid.poke(false.B);m.io.read.bits.poke(0.U)
+      m.io.trainRead.valid.poke(false.B);m.io.trainRead.bits.poke(0.U)
       m.io.load.valid.poke(false.B);m.io.load.bits.index.poke(0.U);m.io.load.bits.data.poke(0.U)
       m.io.writeConf.valid.poke(false.B);m.io.writeConf.bits.index.poke(0.U);m.io.writeConf.bits.conf.poke(0.U)
       m.reset.poke(true.B);m.clock.step(3);m.reset.poke(false.B)
@@ -677,7 +581,21 @@ class HintTest extends AnyFlatSpec with ChiselSim {
       tick();m.io.writeConf.valid.poke(false.B)
       expected=expected.updated(0,expected(0).updated(0,(expected(0)(0) & (~(BigInt(3)<<22)))|(BigInt(3)<<22)))
       for(set<-0 until 8)read(set)
-      // Update/undo each neighbor and each way independently; meta is immutable.
+      // Training reads share one logical port and must not replace a held prediction row.
+      read(7);m.io.read.valid.poke(false.B)
+      val held=expected(7)
+      for(set<-0 until 8;way<-0 until 2){
+        m.io.trainRead.bits.poke((set*2+way).U);m.io.trainRead.valid.poke(true.B)
+        m.io.trainRead.ready.expect(true.B);tick();m.io.trainRespValid.expect(true.B)
+        m.io.trainConf.expect(((expected(set)(way)>>22)&3).U)
+        m.io.respValid.expect(false.B)
+        for(w<-0 until 2)m.io.rows(w).expect(held(w).U)
+      }
+      m.io.read.bits.poke(0.U);m.io.read.valid.poke(true.B)
+      m.io.trainRead.ready.expect(false.B);tick();m.io.respValid.expect(true.B)
+      m.io.trainRespValid.expect(false.B)
+      m.io.trainRead.valid.poke(false.B);m.io.read.valid.poke(false.B)
+      // Update each neighbor and each way independently; metadata is immutable.
       for(set<-0 until 8;way<-0 until 2){
         m.io.read.valid.poke(false.B)
         val previous=expected(set)(way);val value=((set*3+way+2)&3)

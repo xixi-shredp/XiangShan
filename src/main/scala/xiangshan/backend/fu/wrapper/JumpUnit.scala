@@ -92,6 +92,7 @@ class JumpUnit(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg)
     )
   )
   io.toFrontendBJUResolve.get.bits.attribute.rasAction := rasAction
+  io.toFrontendBJUResolve.get.bits.isRVC := io.in.bits.ctrl.isRVC.get
   if (io.toFrontendBJUResolve.get.bits.debug_isRVC.isDefined) {
     io.toFrontendBJUResolve.get.bits.debug_isRVC.get := io.in.bits.ctrl.isRVC.get
   }

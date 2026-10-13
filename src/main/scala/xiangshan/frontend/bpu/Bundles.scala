@@ -37,7 +37,7 @@ import xiangshan.frontend.bpu.tage.TageMeta
 import xiangshan.frontend.bpu.utage.MicroTageMeta
 import xiangshan.frontend.ftq.ResolveSource
 import xiangshan.frontend.ftq.FtqPtr
-import xiangshan.frontend.bpu.hint.HintSnapshot
+import xiangshan.frontend.bpu.hint.{HintSnapshot, HintTraceResolved}
 
 /* *** public const & type *** */
 class BranchAttribute extends Bundle {
@@ -329,6 +329,7 @@ class BpuRedirectMeta(implicit p: Parameters) extends BpuBundle {
 
 // metadata for resolve training (e.g. tage, mainBtb)
 class BpuResolveMeta(implicit p: Parameters) extends BpuBundle {
+  val hintTrace = new HintTraceResolved
   val mbtb:     MainBtbMeta         = new MainBtbMeta
   val tage:     TageMeta            = new TageMeta
   val sc:       ScMeta              = new ScMeta

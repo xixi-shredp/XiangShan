@@ -94,6 +94,7 @@ class BranchUnit(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg) {
   io.toFrontendBJUResolve.get.bits.mispredict := isMisPred
   io.toFrontendBJUResolve.get.bits.attribute.branchType := BranchAttribute.BranchType.Conditional
   io.toFrontendBJUResolve.get.bits.attribute.rasAction := 0.U
+  io.toFrontendBJUResolve.get.bits.isRVC := io.in.bits.ctrl.isRVC.get
   if (io.toFrontendBJUResolve.get.bits.debug_isRVC.isDefined) {
     io.toFrontendBJUResolve.get.bits.debug_isRVC.get := io.in.bits.ctrl.isRVC.get
   }

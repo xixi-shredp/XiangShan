@@ -77,6 +77,7 @@ class ResolveQueue(implicit p: Parameters) extends FtqModule with HalfAlignHelpe
       this.taken      := resolve.taken
       this.mispredict := resolve.mispredict
       this.attribute  := resolve.attribute
+      this.isRVC       := resolve.isRVC
       this.debug_isRVC.foreach(_ := resolve.debug_isRVC.get)
       this.debug_source := source
       this

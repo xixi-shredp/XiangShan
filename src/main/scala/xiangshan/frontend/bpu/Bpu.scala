@@ -33,7 +33,7 @@ import xiangshan.frontend.FtqToBpuIO
 import xiangshan.frontend.GuardedPcInit
 import xiangshan.frontend.bpu.hint.Hint
 import xiangshan.frontend.bpu.hint.HintLoadCmd
-import xiangshan.frontend.bpu.hint.HintProfileEvent
+import xiangshan.frontend.bpu.hint.{HintTraceCommit, HintTraceFoldEvent, HintTraceResolved}
 import xiangshan.frontend.bpu.hint.HintStats
 import xiangshan.frontend.bpu.hint.HintReplayEvent
 import xiangshan.frontend.PrunedAddr
@@ -63,7 +63,8 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
     val hintEnabled = Input(Bool())
     val hintProfile = Input(Bool())
     val hintMeasureActive = Input(Bool())
-    val hintProfileEvent = Output(Valid(new HintProfileEvent))
+    val hintProfileEvent = Output(Valid(new HintTraceFoldEvent))
+    val hintTraceCommit = Output(Valid(new HintTraceCommit))
     val hintStats = Output(new HintStats)
     val hintReplayEvent = Output(Valid(new HintReplayEvent))
   }
@@ -92,6 +93,8 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   hint.io.measureActive := io.hintMeasureActive
   hint.io.redirect := io.fromFtq.redirect
   hint.io.commit := io.fromFtq.hintCommit
+  hint.io.traceCommit := io.fromFtq.hintTraceCommit
+  io.hintTraceCommit := io.fromFtq.hintTraceCommit
   hint.io.resolve := io.fromFtq.hintResolve
   io.hintProfileEvent := hint.io.profileEvent
   io.hintStats := hint.io.stats
@@ -527,6 +530,7 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   s3_redirectMeta.hint         := hint.io.s3Snapshot
 
   private val s3_resolveMeta = Wire(new BpuResolveMeta)
+  s3_resolveMeta.hintTrace := 0.U.asTypeOf(new HintTraceResolved)
   s3_resolveMeta.mbtb     := RegEnable(mbtb.io.meta, s2_fire)
   s3_resolveMeta.tage     := RegEnable(tage.io.meta, s2_fire)
   s3_resolveMeta.sc       := sc.io.meta

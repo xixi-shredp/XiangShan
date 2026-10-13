@@ -11,3 +11,7 @@ extern "C" void h2p_hint_query_v4(unsigned int, unsigned int,
     unsigned long long, unsigned long long, unsigned long long, unsigned int,
     svBit, svBit, svBit, svBit, unsigned int, unsigned int, unsigned int,
     unsigned int) {}
+
+extern "C" void h2p_hint_trace_sink(svBit, svBit, svBit,
+    unsigned long long, unsigned long long, unsigned long long,
+    unsigned int, unsigned int, unsigned long long) {}

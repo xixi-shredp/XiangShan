@@ -58,6 +58,7 @@ import xiangshan.frontend.bpu.BranchAttribute
 import xiangshan.frontend.bpu.BranchInfo
 import xiangshan.frontend.bpu.CompareMatrix
 import xiangshan.frontend.bpu.HalfAlignHelper
+import xiangshan.frontend.bpu.hint.HintTraceResolved
 import xiangshan.frontend.icache.ICacheDataHelper
 import xiangshan.frontend.icache.ICacheToFtqIO
 import xiangshan.frontend.icache.TwoFetchFailReason
@@ -220,6 +221,7 @@ class Ftq(implicit p: Parameters) extends FtqModule
     val s3BpuPtr = io.fromBpu.s3FtqPtr.value
     metaQueueRedirect(s3BpuPtr) := io.fromBpu.meta.bits.redirectMeta
     metaQueueResolve(s3BpuPtr)  := io.fromBpu.meta.bits.resolveMeta
+    metaQueueResolve(s3BpuPtr).hintTrace.generation := io.fromBpu.s3FtqPtr.flag
     metaQueueCommit(s3BpuPtr)   := io.fromBpu.meta.bits.commitMeta
 
     s3PerfQueue(s3BpuPtr).bpuPerf := io.fromBpu.perfMeta
@@ -571,6 +573,52 @@ class Ftq(implicit p: Parameters) extends FtqModule
     lastPerfMetas(i) := curPerfMeta
   }
 
+  // A compact actual terminal CFI is part of the existing resolve metadata.
+  // It contains no contexts and is retained only until this FTQ commits.
+  private val traceResolveByLane = Wire(Vec(backendParams.BrhCnt, new HintTraceResolved))
+  io.fromBackend.resolve.zipWithIndex.foreach { case (resolved, lane) =>
+    val ptr = resolved.bits.ftqIdx
+    val resident = entryQueue(ptr.value)
+    val previous = WireInit(MuxCase(metaQueueResolve(ptr.value).hintTrace,
+      (0 until lane).reverse.map { earlier =>
+        val r = io.fromBackend.resolve(earlier)
+        (r.valid && r.bits.ftqIdx === ptr) -> traceResolveByLane(earlier)
+      }))
+    val updated = WireInit(previous)
+    val sameGeneration = previous.generation === ptr.flag && ptr >= commitPtr(0) && ptr < bpuPtr(0)
+    val killed = redirect.valid && (ptr >= redirect.bits.newFtqIdx ||
+      (ptr === redirect.bits.ftqIdx && (resolved.bits.ftqOffset > redirect.bits.ftqOffset ||
+        (redirect.bits.flushItself() && resolved.bits.ftqOffset === redirect.bits.ftqOffset))))
+    val terminal = resolved.bits.taken && resolved.bits.attribute.needIttage
+    val originalPosition = getCfiPcFromPosition(resident.startPc, resident.endPosition).toUInt
+    val resolvedPosition = getCfiPcFromOffset(resident.startPc.unGuard, resolved.bits.ftqOffset).toUInt
+    when(resolved.valid && terminal && sameGeneration && !killed &&
+      (!previous.valid || resolved.bits.ftqOffset <= previous.offset)) {
+      updated.valid := true.B
+      updated.eligible := true.B
+      updated.target := resolved.bits.target.toUInt.asSInt.pad(64).asUInt(47, 1)
+      updated.offset := resolved.bits.ftqOffset
+      updated.isRVC := resolved.bits.isRVC
+      updated.baselineMiss := !resident.taken || originalPosition =/= resolvedPosition ||
+        resident.target.toUInt =/= resolved.bits.target.toUInt
+      metaQueueResolve(ptr.value).hintTrace := updated
+    }
+    traceResolveByLane(lane) := updated
+  }
+  // Apply the same surviving-prefix rule as actual FTQ redirection, including
+  // flush-self replay. This never gates prediction or backend retirement.
+  when(redirect.valid) {
+    for (i <- 0 until FtqSize) {
+      val trace = metaQueueResolve(i).hintTrace
+      val ptr = FtqPtr(trace.generation, i.U)
+      when(ptr >= redirect.bits.newFtqIdx ||
+        (ptr === redirect.bits.ftqIdx && (trace.offset > redirect.bits.ftqOffset ||
+          (redirect.bits.flushItself() && trace.offset === redirect.bits.ftqOffset)))) {
+        trace.valid := false.B
+      }
+    }
+  }
+
   // --------------------------------------------------------------------------------
   // Commit and train BPU
   // --------------------------------------------------------------------------------
@@ -589,6 +637,29 @@ class Ftq(implicit p: Parameters) extends FtqModule
 
   io.toBpu.hintCommit.valid := commit
   io.toBpu.hintCommit.bits := commitPtr(0)
+
+  private val traceCommitMeta = metaQueueResolve(commitPtr(0).value).hintTrace
+  private val traceCommitEntry = entryQueue(commitPtr(0).value)
+  private val traceCommitPc = getRealCfiPcFromOffset(traceCommitEntry.startPc.unGuard,
+    traceCommitMeta.offset, traceCommitMeta.isRVC).asSInt.pad(64).asUInt
+  io.toBpu.hintTraceCommit.valid := commit && traceCommitMeta.valid &&
+    traceCommitMeta.generation === commitPtr(0).flag
+  io.toBpu.hintTraceCommit.bits.snapshot := metaQueueRedirect(commitPtr(0).value).hint
+  io.toBpu.hintTraceCommit.bits.actualPc := traceCommitPc
+  io.toBpu.hintTraceCommit.bits.actualTarget := Cat(Fill(16, traceCommitMeta.target(46)), traceCommitMeta.target, 0.U(1.W))
+  io.toBpu.hintTraceCommit.bits.baselineMiss := traceCommitMeta.baselineMiss
+  io.toBpu.hintTraceCommit.bits.queryStartPc := traceCommitEntry.startPc.toUInt.asSInt.pad(64).asUInt
+  io.toBpu.hintTraceCommit.bits.ftqTag := commitPtr(0).asUInt
+  io.toBpu.hintTraceCommit.bits.pcId := 0.U // actual CAM index is selected by Hint
+  io.toBpu.hintTraceCommit.bits.queryValid := traceCommitMeta.generation === commitPtr(0).flag
+  io.toBpu.hintTraceCommit.bits.eligible := traceCommitMeta.eligible
+  io.toBpu.hintTraceCommit.bits.queryCycle.foreach(_ := perfQueue(commitPtr(0).value).bpuPerf.debug_hintQueryCycle.get)
+  io.toBpu.hintTraceCommit.bits.baselinePc.foreach(_ := getCfiPcFromPosition(traceCommitEntry.startPc,
+    traceCommitEntry.endPosition).toUInt.asSInt.pad(64).asUInt)
+  io.toBpu.hintTraceCommit.bits.baselineTarget.foreach(_ := traceCommitEntry.target.toUInt.asSInt.pad(64).asUInt)
+  io.toBpu.hintTraceCommit.bits.baselineValid.foreach(_ := traceCommitEntry.taken &&
+    getCfiPcFromPosition(traceCommitEntry.startPc, traceCommitEntry.endPosition).toUInt ===
+      getCfiPcFromOffset(traceCommitEntry.startPc.unGuard, traceCommitMeta.offset).toUInt)
 
   commitQueue.io.backendCommit := io.fromBackend.callRetCommit
 
