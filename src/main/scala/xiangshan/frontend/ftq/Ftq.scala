@@ -584,7 +584,6 @@ class Ftq(implicit p: Parameters) extends FtqModule
         val r = io.fromBackend.resolve(earlier)
         (r.valid && r.bits.ftqIdx === ptr) -> traceResolveByLane(earlier)
       }))
-    val updated = WireInit(previous)
     val sameGeneration = previous.generation === ptr.flag && ptr >= commitPtr(0) && ptr < bpuPtr(0)
     val killed = redirect.valid && (ptr >= redirect.bits.newFtqIdx ||
       (ptr === redirect.bits.ftqIdx && (resolved.bits.ftqOffset > redirect.bits.ftqOffset ||
@@ -592,15 +591,22 @@ class Ftq(implicit p: Parameters) extends FtqModule
     val terminal = resolved.bits.taken && resolved.bits.attribute.needIttage
     val originalPosition = getCfiPcFromPosition(resident.startPc, resident.endPosition).toUInt
     val resolvedPosition = getCfiPcFromOffset(resident.startPc.unGuard, resolved.bits.ftqOffset).toUInt
-    when(resolved.valid && terminal && sameGeneration && !killed &&
-      (!previous.valid || resolved.bits.ftqOffset <= previous.offset)) {
-      updated.valid := true.B
-      updated.eligible := true.B
-      updated.target := resolved.bits.target.toUInt.asSInt.pad(64).asUInt(47, 1)
-      updated.offset := resolved.bits.ftqOffset
-      updated.isRVC := resolved.bits.isRVC
-      updated.baselineMiss := !resident.taken || originalPosition =/= resolvedPosition ||
-        resident.target.toUInt =/= resolved.bits.target.toUInt
+    // Reuse the existing resolve-order perf update, which includes all earlier
+    // lanes and the current branch. A known earlier mispredict cuts the FTQ.
+    val knownPrefix = lastPerfMetas(lane)
+    val (actualPosition, actualCarry) = getAlignedPosition(resident.startPc, resolved.bits.ftqOffset)
+    val (previousPosition, previousCarry) = getAlignedPosition(resident.startPc, previous.offset)
+    val candidate = WireInit(previous)
+    candidate.target := resolved.bits.target.toUInt.asSInt.pad(64).asUInt(47, 1)
+    candidate.offset := resolved.bits.ftqOffset
+    candidate.isRVC := resolved.bits.isRVC
+    candidate.baselineMiss := !resident.taken || originalPosition =/= resolvedPosition ||
+      resident.target.toUInt =/= resolved.bits.target.toUInt
+    val updated = HintTracePrefix.resolve(previous, candidate,
+      resolved.valid, sameGeneration, killed, terminal, knownPrefix.mispredict,
+      knownPrefix.mispredictBranchInfo.cfiPosition, actualPosition, previousPosition,
+      actualCarry, previousCarry)
+    when(resolved.valid && sameGeneration && !killed) {
       metaQueueResolve(ptr.value).hintTrace := updated
     }
     traceResolveByLane(lane) := updated
@@ -642,8 +648,18 @@ class Ftq(implicit p: Parameters) extends FtqModule
   private val traceCommitEntry = entryQueue(commitPtr(0).value)
   private val traceCommitPc = getRealCfiPcFromOffset(traceCommitEntry.startPc.unGuard,
     traceCommitMeta.offset, traceCommitMeta.isRVC).asSInt.pad(64).asUInt
-  io.toBpu.hintTraceCommit.valid := commit && traceCommitMeta.valid &&
-    traceCommitMeta.generation === commitPtr(0).flag
+  // Validate the actual resolved CFI, including branches absent from the BPU
+  // prediction. Do not gate on predicted taken/endPosition/branch attribute.
+  private val traceCommitPerf = perfQueue(commitPtr(0).value)
+  private val (traceCommitPosition, traceCommitCarry) = getAlignedPosition(
+    traceCommitEntry.startPc, traceCommitMeta.offset)
+  private val traceCommitSurvives = HintTracePrefix.commitAllowed(traceCommitMeta,
+    traceCommitMeta.generation === commitPtr(0).flag,
+    traceCommitPerf.isCfi(traceCommitPosition),
+    traceCommitPerf.cfiAttr(traceCommitPosition).needIttage,
+    traceCommitCarry, traceCommitPerf.mispredict, traceCommitPosition,
+    traceCommitPerf.mispredictBranchInfo.cfiPosition)
+  io.toBpu.hintTraceCommit.valid := commit && traceCommitSurvives
   io.toBpu.hintTraceCommit.bits.snapshot := metaQueueRedirect(commitPtr(0).value).hint
   io.toBpu.hintTraceCommit.bits.actualPc := traceCommitPc
   io.toBpu.hintTraceCommit.bits.actualTarget := Cat(Fill(16, traceCommitMeta.target(46)), traceCommitMeta.target, 0.U(1.W))
