@@ -37,6 +37,8 @@ class FtqEntry(implicit p: Parameters) extends FtqBundle {
   val target:      GuardedPc = GuardedPc()
   val taken:       Bool      = Bool()
   val endPosition: UInt      = UInt(CfiPositionWidth.W)
+  // Exactly five bits: FTQ owns allocation identity; Hint stores payload only.
+  val hint = Valid(UInt(4.W))
 }
 
 class MetaEntry(implicit p: Parameters) extends FtqBundle {

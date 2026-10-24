@@ -1,417 +1,308 @@
 #!/usr/bin/env python3
-"""Independent RTL Hint v3 discovery, profile, finite build and replay.
+"""Remote RTL smoke pipeline using the standalone public SPEC trace CLI.
 
-The only shared input is the finite-v3 format/scoring code. Every branch trace
-in this pipeline is emitted by this RTL emulator's Verilator DPI observer.
+Execute on ps1/ps2. --deps supplies ref_so, gcpt_restore, boot_flash and optionally
+emu/checkpoint_root. No guest mutation or private simulator format is required.
 """
 from __future__ import annotations
-
 import argparse
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import gzip
+from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
+import hint_cam58
 
 ROOT = Path(__file__).resolve().parents[2]
 RTL = ROOT / "rtl"
-sys.path.insert(0, str(ROOT / "xs-gem5" / "util"))
-from h2p_hint import finite_v3 as finite  # noqa: E402
-
-CONTRACT = finite.contract
-MARKER = re.compile(
-    r"H2P_RUN_INSTR=(\d+) H2P_WARMUP_INSTR=(\d+) "
-    r"H2P_MEASURE_INSTR=(\d+) H2P_MEASURE_CYCLES=(\d+)"
-)
+TOOL = ROOT / "xs-gem5/util/h2p_hint/spec_trace.py"
+MARKER = re.compile(r"H2P_RUN_INSTR=(\d+) H2P_WARMUP_INSTR=(\d+) H2P_MEASURE_INSTR=(\d+) H2P_MEASURE_CYCLES=(\d+)")
 
 
-def sha(path: Path) -> str:
-    return finite.digest(path)
+def sha(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def config() -> dict:
-    cfg = json.loads((ROOT / "manifest" / "test.json").read_text())
-    if cfg["warmup_insts"] != 1_000_000 or cfg["measure_insts"] != 1_000_000:
-        raise ValueError("formal manifest must specify 1M warmup + 1M measure")
-    return cfg
+def path_value(value):
+    path = Path(value).expanduser()
+    return (ROOT / path).resolve() if not path.is_absolute() else path.resolve()
 
 
-def checkpoint(workload_id: str) -> Path:
-    cfg = config()
-    workloads = json.loads((ROOT / "manifest" / cfg["workload_manifest"]).resolve().read_text())
-    choices = {
-        f"{row['bench']}_test/{point}"
-        for row in workloads["cpts"] for point in row["cpt_list"]
-    }
-    if workload_id not in choices:
-        raise ValueError(f"not one of the five declared slices: {workload_id}")
-    directory = Path(workloads["workload_root"]) / "cpts" / "xsgem5" / workload_id
-    files = list(directory.glob("*_memory_.zstd"))
-    if len(files) != 1:
-        raise ValueError(f"expected one GCPT memory image in {directory}")
-    return files[0]
+def public_tool(action, out, trace=None, meta=None, cam=None, image=None, kind=None):
+    command = [sys.executable, str(TOOL), action]
+    for flag, value in (("trace", trace), ("meta", meta), ("cam", cam),
+                        ("image", image), ("kind", kind)):
+        if value is not None:
+            command += ["--" + flag, str(value)]
+    if out is not None:
+        command += ["--output", str(out)]
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise RuntimeError(f"public builder failed: {command}\n{result.stderr}")
+    return json.loads(result.stdout)
 
 
-def build_identity(emu: Path, ref: Path, restore: Path, flash: Path, cpt: Path) -> dict:
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=RTL, text=True).strip()
-    if head != config()["rtl"]["commit"]:
-        raise ValueError(f"RTL HEAD mismatch: {head}")
-    audit_path = (ROOT / "manifest" / config()["rtl"]["nemu_build_audit"]).resolve()
-    audit = json.loads(audit_path.read_text())
-    if (audit["so_sha256"] != sha(ref) or
-            audit["boot_flash_sha256"] != sha(flash) or
-            audit["boot_flash_hex"] != flash.read_bytes().hex() or
-            audit["state_bytes_observed"] != 1400):
-        raise ValueError("NEMU SO or boot flash differs from audited kmhv3 build")
-    changed = subprocess.check_output(["git", "status", "--porcelain=v1"], cwd=RTL, text=True)
-    source_files = [
-        RTL / "src/main/scala/xiangshan/frontend/Frontend.scala",
-        RTL / "src/main/scala/xiangshan/frontend/Bundles.scala",
-        RTL / "src/main/scala/xiangshan/frontend/bpu/Bpu.scala",
-        RTL / "src/main/scala/xiangshan/frontend/bpu/Bundles.scala",
-        RTL / "src/main/scala/xiangshan/frontend/ftq/Ftq.scala",
-        RTL / "src/main/scala/xiangshan/frontend/ftq/Bundles.scala",
-        RTL / "src/main/scala/xiangshan/frontend/simfrontend/SimFrontend.scala",
-        RTL / "src/main/scala/xiangshan/frontend/bpu/hint/Hint.scala",
-        RTL / "src/main/scala/xiangshan/frontend/bpu/hint/HintDpi.scala",
-        RTL / "src/main/scala/xiangshan/frontend/bpu/hint/HintProfileDpi.scala",
-        RTL / "src/main/scala/xiangshan/frontend/bpu/hint/HintReplayDpi.scala",
-        RTL / "src/main/scala/xiangshan/backend/CtrlBlock.scala",
-        RTL / "src/main/scala/xiangshan/backend/fu/wrapper/BranchUnit.scala",
-        RTL / "src/main/scala/xiangshan/backend/fu/wrapper/JumpUnit.scala",
-        RTL / "difftest/src/test/csrc/common/hint_dpi.cpp",
-        RTL / "difftest/src/test/csrc/emu/emu.cpp",
-        RTL / "difftest/src/test/csrc/plugin/simfrontend/ftq.cpp",
-        RTL / "difftest/src/test/csrc/plugin/simfrontend/ftq.h",
-        RTL / "difftest/src/test/csrc/plugin/simfrontend/simfrontend.cpp",
-        RTL / "difftest/src/test/csrc/plugin/simfrontend/simfrontend.h",
-        Path(__file__),
-        Path(finite.__file__), ROOT / "manifest/hint_v3.py",
-        ROOT / "manifest/test.json", ROOT / "workload/cpython-heavy.json",
-        audit_path,
-    ]
-    return {
-        "rtl_head": head, "rtl_status": changed,
-        "source_sha256": {str(path.relative_to(ROOT)): sha(path) for path in source_files},
-        "emulator_sha256": sha(emu), "nemu_sha256": sha(ref),
-        "gcpt_restore_sha256": sha(restore), "boot_flash_sha256": sha(flash),
-        "checkpoint_sha256": sha(cpt),
-    }
+def trace_meta(trace, kind, cam=None):
+    width = 7 if kind == "discovery" else 22
+    size = trace.stat().st_size
+    if size % width:
+        raise ValueError("truncated RTL raw record")
+    audit = [json.loads(line) for line in Path(str(trace) + ".audit.jsonl").read_text().splitlines()]
+    footer = audit[-1]
+    if not footer.get("complete"):
+        raise ValueError("RTL trace audit is incomplete")
+    meta = {"schema": "hint-spec-trace", "version": 1, "hash_version": 7,
+            "mask_order": ["ITH", "Call", "Ret", "LHR"], "kind": kind,
+            "record_bytes": width, "termination": "final", "capacity_records": size // width,
+            "data_sha256": sha(trace), "p_error": footer.get("p_error", 0),
+            "audit_sha256": sha(Path(str(trace) + ".audit.jsonl")),
+            "stop_reason": "instruction-limit", "fetch_block_bytes": 64, "fetch_align_bytes": 32,
+            "capture": footer}
+    if cam:
+        meta["cam_sha256"] = json.loads(cam.read_text())["image_sha256"]
+    path = trace.with_suffix(".json")
+    write_json(path, meta)
+    public_tool("validate", trace.with_suffix(".validation.json"), trace, path, cam)
+    return path
 
 
-def parse_marker(log: Path, warmup: int, measure: int) -> dict:
+def parse_marker(log, warmup_insts, measure_insts):
     data = log.read_text(errors="replace")
-    found = MARKER.findall(data)
-    if len(found) != 1:
-        raise ValueError(f"missing or repeated H2P instruction audit marker: {log}")
-    total, used_warmup, actual_measure, cycles = map(int, found[0])
-    if used_warmup != warmup or total < warmup + measure or actual_measure < measure:
-        raise ValueError(f"short or mismatched RTL instruction count: {found[0]}")
-    if cycles <= 0 or "Warmup finished" not in data:
-        raise ValueError(f"missing measurement cycle/warmup marker in {log}")
-    if "ABORT at pc" in data or "HIT BAD TRAP" in data or "difftest mismatch" in data.lower():
-        raise ValueError(f"RTL/NEMU mismatch or abort in {log}")
-    stat_lines = re.findall(r"^H2P_HINT_STATS (.+)$", data, re.MULTILINE)
-    if len(stat_lines) != 1:
-        raise ValueError(f"missing or repeated Hint counter marker: {log}")
-    counters = dict((name, int(value)) for name, value in
-                    re.findall(r"([a-z0-9_]+)=(\d+)", stat_lines[0]))
-    required = {"cam_miss", "context_miss", "conf0_fallback", "overrides",
-                "meta_stall", "lhr_stall", "conf_up", "conf_down", "conf_dropped"}
-    if set(counters) != required:
-        raise ValueError(f"incomplete Hint counters in {log}")
-    return {"total_instructions": total, "warmup_instructions": used_warmup,
-            "measure_instructions": actual_measure, "measure_cycles": cycles,
-            "ipc": actual_measure / cycles, "hint_counters": counters}
+    markers = MARKER.findall(data)
+    if len(markers) != 1:
+        raise ValueError(f"missing/repeated measure marker: {log}")
+    total, warmup, measure, cycles = map(int, markers[0])
+    if warmup < warmup_insts or measure < measure_insts or total != warmup + measure or cycles <= 0:
+        raise ValueError(f"invalid {warmup_insts} warmup + {measure_insts} measure boundary: {markers[0]}")
+    if any(text in data.lower() for text in ("abort at pc", "hit bad trap", "difftest mismatch")):
+        raise ValueError(f"RTL/NEMU failure: {log}")
+    stats = re.findall(r"^H2P_HINT_STATS (.+)$", data, re.MULTILINE)
+    if len(stats) != 1:
+        raise ValueError("missing Hint statistics")
+    return {"total_instructions": total, "warmup_instructions": warmup,
+            "measure_instructions": measure, "measure_cycles": cycles, "ipc": measure / cycles,
+            "hint_counters": {key: int(value) for key, value in re.findall(r"([a-z0-9_]+)=(\d+)", stats[0])}}
 
 
-def run_emu(name: str, out: Path, mode: str, cpt: Path, restore: Path, flash: Path, ref: Path,
-            warmup: int, measure: int, image: Path | None = None,
-            profile: Path | None = None, replay: Path | None = None,
-            dry_run: bool = False) -> dict:
-    emu = RTL / "build/emu"
-    command = [str(emu), "-i", str(cpt), "-r", str(restore), "-F", str(flash),
-               "--diff", str(ref),
-               "-W", str(warmup), "-I", str(warmup + measure)]
+def run_emu(output, mode, checkpoint, deps, warmup_insts, measure_insts, image=None):
+    output.mkdir(parents=True, exist_ok=False)
+    emu = path_value(deps.get("emu", deps.get("emulator", "rtl/build/emu")))
+    inputs = [emu, checkpoint] + [path_value(deps[key]) for key in ("gcpt_restore", "boot_flash", "ref_so")]
+    if image:
+        image_manifest = image.with_suffix(".adapter.json")
+        adapted = json.loads(image_manifest.read_text())
+        if adapted.get("image_sha256") != sha(image) or adapted.get("adapter_sha256") != sha(Path(hint_cam58.__file__)):
+            raise ValueError("CAM58 loaded image/adapter identity differs from adapter manifest")
+        for key in ("public_image", "selection", "public_cam"):
+            path = Path(adapted[key])
+            if sha(path) != adapted[key + "_sha256"]:
+                raise ValueError(f"CAM58 {key} changed before loading")
+            inputs.append(path)
+        inputs.append(image_manifest)
+    for path in inputs + ([image] if image else []):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    command = [str(emu), "-i", str(checkpoint), "-r", str(inputs[2]), "-F", str(inputs[3]),
+               "--diff", str(inputs[4]), "-W", str(warmup_insts), "-I", str(warmup_insts + measure_insts),
+               f"--measure-instr={measure_insts}"]
+    dram_ini = deps.get("dramsim3_ini", "deps/DRAMsim3/configs/XiangShan.ini")
+    if dram_ini is not None:
+        ini = path_value(dram_ini)
+        if not ini.is_file():
+            raise FileNotFoundError(ini)
+        command += ["--dramsim3-ini", str(ini), "--dramsim3-outdir", str(output)]
+        inputs.append(ini)
     env = os.environ.copy()
-    env.update({"H2P_HINT_MODE": mode, "H2P_HINT_WARMUP_INSTR": str(warmup)})
-    if image is not None:
+    for key in list(env):
+        if key.startswith("H2P_"):
+            del env[key]
+    env.update(H2P_HINT_MODE=mode, H2P_HINT_WARMUP_INSTR=str(warmup_insts), H2P_RUNTIME_CONTRACT="1",
+               H2P_TARGET_SUMMARY=str(output / "targets.json"))
+    trace = None
+    if image:
         env["H2P_HINT_IMAGE"] = str(image)
-    else:
-        env.pop("H2P_HINT_IMAGE", None)
-    if profile is not None:
-        env["H2P_HINT_PROFILE"] = str(profile)
-    else:
-        env.pop("H2P_HINT_PROFILE", None)
-    if replay is not None:
-        env["H2P_HINT_REPLAY"] = str(replay)
-    else:
-        env.pop("H2P_HINT_REPLAY", None)
-    info = {"name": name, "mode": mode, "command": command,
-            "image_sha256": sha(image) if image and not dry_run else None,
-            "profile": str(profile) if profile else None,
-            "replay": str(replay) if replay else None}
-    if dry_run:
-        return info
-    before = {str(path): sha(path) for path in (emu, cpt, restore, flash, ref)}
-    if image is not None:
-        before[str(image)] = sha(image)
-    status_path = out / "status.json"
-    if status_path.is_file():
-        prior = json.loads(status_path.read_text())
-        for key in ("name", "mode", "command", "image_sha256", "profile", "replay"):
-            if prior.get(key) != info.get(key):
-                raise ValueError(f"resumed RTL run differs in {key}: {out}")
-        if prior.get("exit_code") != 0 or prior.get("inputs_sha256") != before:
-            raise ValueError(f"cannot resume changed or failed RTL run: {out}")
-        actual = parse_marker(Path(prior["log"]), warmup, measure)
-        if image is not None and f"Hint DPI: validated {image}" not in Path(prior["log"]).read_text(errors="replace"):
-            raise ValueError(f"resumed RTL image load marker missing: {out}")
-        for key, value in actual.items():
-            if prior.get(key) != value:
-                raise ValueError(f"resumed RTL run metrics changed: {out}")
-        for key, path in (("profile_sha256", profile), ("replay_sha256", replay)):
-            if path is not None and prior.get(key) != sha(path):
-                raise ValueError(f"resumed RTL run trace changed: {out}")
-        return prior
-    out.mkdir(parents=True, exist_ok=False)
-    log = out / "emu.log"
+    if mode in ("discover", "profile"):
+        trace = output / "trace.bin"
+        env["H2P_HINT_PROFILE"] = str(trace)
+        env["H2P_HINT_TRACE_COMMIT"] = str(trace)
+    if mode == "hint":
+        env["H2P_HINT_REPLAY"] = str(output / "replay.jsonl.gz")
+    hashes = {str(path): sha(path) for path in inputs + ([image] if image else [])}
+    log = output / "emu.log"
     with log.open("w") as stream:
-        completed = subprocess.run(command, cwd=RTL, env=env, stdout=stream,
-                                   stderr=subprocess.STDOUT, check=False)
-    info["exit_code"] = completed.returncode
-    info["log"] = str(log)
-    info["inputs_sha256"] = before
-    after = {path: sha(Path(path)) for path in before}
-    if before != after:
-        raise ValueError(f"RTL run input changed during execution: {name}")
-    if completed.returncode:
-        write_json(out / "status.json", info)
-        raise RuntimeError(f"RTL run {name} failed: {completed.returncode}; {log}")
-    info.update(parse_marker(log, warmup, measure))
-    if image is not None and f"Hint DPI: validated {image}" not in log.read_text(errors="replace"):
-        raise ValueError(f"RTL image validation/load marker missing: {log}")
-    if profile is not None:
-        if not profile.is_file():
-            raise ValueError(f"RTL did not produce profile: {profile}")
-        info["profile_sha256"] = sha(profile)
-    if replay is not None:
-        if not replay.is_file():
-            raise ValueError(f"RTL did not produce replay events: {replay}")
-        info["replay_sha256"] = sha(replay)
-    write_json(out / "status.json", info)
-    return info
+        result = subprocess.run(command, cwd=RTL, env=env, stdout=stream, stderr=subprocess.STDOUT, check=False)
+    status = {"mode": mode, "command": command, "inputs_sha256": hashes, "exit_code": result.returncode,
+              "requested_warmup_instructions": warmup_insts, "requested_measure_instructions": measure_insts,
+              "environment": {key: value for key, value in env.items() if key.startswith("H2P_")}}
+    write_json(output / "status.json", status)
+    if result.returncode:
+        raise RuntimeError(f"RTL run failed ({result.returncode}): {log}")
+    if hashes != {str(path): sha(Path(path)) for path in hashes}:
+        raise ValueError("run input changed during execution")
+    if image and "H2P_HINT_LOAD_COMPLETE" not in log.read_text():
+        raise ValueError("image table-write handshake completion missing")
+    status.update(parse_marker(log, warmup_insts, measure_insts))
+    if trace:
+        status["trace_sha256"] = sha(trace)
+    write_json(output / "status.json", status)
+    return status, trace
 
 
-def discovery_top20(path: Path) -> tuple[list[int], dict]:
-    misses, counts = Counter(), Counter()
-    last_seq = -1
-    with gzip.open(path, "rt") as stream:
-        header = json.loads(next(stream))
-        if header != {"kind": "discovery_header", "format": "h2p-hint-discovery", "version": 3}:
-            raise ValueError("bad RTL discovery header")
-        for line in stream:
-            row = json.loads(line)
-            if row["kind"] != "branch" or row["seq"] <= last_seq:
-                raise ValueError("discovery sequence is not committed order")
-            last_seq = row["seq"]
-            pc = int(row["pc"], 16)
-            CONTRACT.address_word(pc)
-            counts[pc] += 1
-            misses[pc] += not row["baseline_valid"] or row["baseline_target"] != row["actual"]
-    top = sorted((pc for pc in counts if misses[pc] > 0),
-                 key=lambda pc: (-misses[pc], -counts[pc], pc))[:20]
-    return top, {"top20": [{"pc": hex(pc), "misses": misses[pc],
-                            "executions": counts[pc]} for pc in top],
-                 "observed_indirect_pcs": len(counts)}
+def resource_budget(requested_jobs, slice_count):
+    """Conservative startup admission; the outer dispatcher chooses each server."""
+    info = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 2:
+            info[fields[0].rstrip(":")] = int(fields[1]) * 1024
+    available = info.get("MemAvailable", 0)
+    affinity = sorted(os.sched_getaffinity(0))
+    load1, load5, load15 = os.getloadavg()
+    cpu_remaining = max(0, len(affinity) - math.ceil(load1))
+    per_emu = 12 * 1024 ** 3
+    memory_slots = available // per_emu
+    effective = min(requested_jobs, slice_count, memory_slots, cpu_remaining)
+    audit = {"timestamp_utc": datetime.now(timezone.utc).isoformat(),
+             "hostname": socket.gethostname(), "mem_available_bytes": available,
+             "cpu_affinity": affinity, "affinity_cpu_count": len(affinity),
+             "load_average": [load1, load5, load15], "cpu_remaining": cpu_remaining,
+             "per_emu_memory_bytes": per_emu, "memory_job_limit": memory_slots,
+             "requested_jobs": requested_jobs, "slice_count": slice_count,
+             "effective_jobs": effective,
+             "policy": "min(requested,slices,MemAvailable/12GiB,affinity-ceil(load1)); startup admission only"}
+    return audit
 
 
-def candidate_image(pcs: list[int], source: dict, path: Path) -> None:
-    metadata = {"format": "h2p-hint", "version": 3, "storage": "finite",
-                "hash_version": 3, "mask_order": CONTRACT.MASK_ORDER,
-                "history": CONTRACT.HISTORY, "layout": CONTRACT.LAYOUT,
-                "cam": [{"pc": hex(pc), "mask": 0} for pc in sorted(pcs)],
-                "slots": [], "entries": [], "source": source}
-    path.write_bytes(CONTRACT.pack_image(metadata))
-
-
-def replay_report(path: Path) -> dict:
-    per_pc: dict[int, Counter] = {}
-    total = Counter()
-    last_seq = -1
-    with gzip.open(path, "rt") as stream:
-        header = json.loads(next(stream))
-        if header != {"kind": "header", "format": "h2p-hint-replay", "version": 3}:
-            raise ValueError("bad RTL Hint replay header")
-        for line in stream:
-            row = json.loads(line)
-            if row["kind"] != "branch" or row["seq"] <= last_seq:
-                raise ValueError("replay events not in committed order")
-            last_seq = row["seq"]
-            pc = int(row["pc"], 16)
-            counts = per_pc.setdefault(pc, Counter())
-            before = row["baseline_target"] != row["actual"]
-            after = row["final_target"] != row["actual"]
-            for counter in (counts, total):
-                counter["executions"] += 1
-                counter["baseline_target_misses"] += before
-                counter["hint_target_misses"] += after
-                counter["corrected"] += before and not after
-                counter["harmed"] += not before and after
-                counter["used_hint"] += row["used_hint"]
-                counter["conf0"] += row["context_hit"] and row["conf_at_prediction"] == 0
-    return {"total": dict(total),
-            "pcs": [{"pc": hex(pc), **dict(counts)}
-                    for pc, counts in sorted(per_pc.items())]}
-
-
-def run_slice(workload_id: str, output: Path, warmup: int, measure: int,
-              through: str, dry_run: bool) -> dict:
-    cfg = config()["rtl"]
-    cpt = checkpoint(workload_id)
-    restore = Path(cfg["gcpt_restore"])
-    flash = (ROOT / "manifest" / cfg["boot_flash"]).resolve()
-    ref = (ROOT / "manifest" / cfg["nemu_so"]).resolve()
-    emu = RTL / "build/emu"
-    for required in (cpt, restore, flash, ref, emu):
-        if not required.is_file():
-            raise FileNotFoundError(required)
-    identity = build_identity(emu, ref, restore, flash, cpt)
+def run_slice(slice_id, checkpoint, output, deps, through, execution_server, budget, warmup_insts, measure_insts):
     output.mkdir(parents=True, exist_ok=True)
-    identity_path = output / "identity.json"
-    if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
-        raise ValueError("RTL source/executable identity differs from existing output")
-    write_json(identity_path, identity)
+    identity = {"checkpoint_sha256": sha(checkpoint), "builder_sha256": sha(TOOL),
+                "cam58_adapter_sha256": sha(Path(hint_cam58.__file__)),
+                "runner_sha256": sha(Path(__file__)), "host": socket.gethostname(),
+                "execution_server": execution_server, "resource_budget": budget,
+                "requested_warmup_instructions": warmup_insts, "requested_measure_instructions": measure_insts}
+    write_json(output / "identity.json", identity)
     runs = []
-    for name, mode, profile in (("baseline", "off", None),
-                                ("discovery", "discover", output / "discovery" / "branches.jsonl.gz")):
-        runs.append(run_emu(name, output / name, mode, cpt, restore, flash, ref,
-                            warmup, measure, profile=profile, dry_run=dry_run))
-    if dry_run or through == "discovery":
-        write_json(output / "runs.json", runs)
-        return {"runs": runs}
-    if runs[0]["measure_cycles"] != runs[1]["measure_cycles"]:
-        raise ValueError("observer changed baseline cycle count")
-    top, discovery = discovery_top20(output / "discovery" / "branches.jsonl.gz")
-    write_json(output / "discovery.json", discovery)
-    source = {"workload_id": workload_id,
-              "checkpoint_sha256": identity["checkpoint_sha256"],
-              "profile_sha256": sha(output / "discovery" / "branches.jsonl.gz"),
-              "builder_sha256": sha(Path(finite.__file__))}
-    profiles = []
-    for group_id, first in enumerate(range(0, len(top), 16)):
-        pcs = top[first:first + 16]
-        group = output / f"profile-{group_id}"
-        group.mkdir(exist_ok=True)
-        candidate = group / "candidates.bin"
-        expected_candidate = group / "candidates.new.bin"
-        candidate_image(pcs, source, expected_candidate)
-        if candidate.exists() and candidate.read_bytes() != expected_candidate.read_bytes():
-            raise ValueError("resumed candidate image changed")
-        expected_candidate.replace(candidate)
-        profile = group / "branches.jsonl.gz"
-        runs.append(run_emu(f"profile-{group_id}", group / "run", "profile",
-                            cpt, restore, flash, ref, warmup, measure,
-                            image=candidate, profile=profile))
-        if runs[-1]["measure_cycles"] != runs[0]["measure_cycles"]:
-            raise ValueError("profile observer changed baseline cycle count")
-        header, rows = finite.read_profile(profile)
-        if set(int(pc, 16) for pc in header["pcs"]) != set(pcs):
-            raise ValueError("profile group CAM identity mismatch")
-        profiles.append(profile)
-    if through == "profile":
-        write_json(output / "runs.json", runs)
-        return {"runs": runs, "discovery": discovery}
-    if profiles:
-        _, rows = finite.merge_profiles(profiles, top)
-    else:
-        rows = []
-    source["profile_sha256"] = hashlib.sha256(
-        "\n".join(sha(path) for path in profiles).encode()).hexdigest()
-    scores = []
-    for profile in profiles:
-        header, group_rows = finite.read_profile(profile)
-        group_pcs = [int(pc, 16) for pc in header["pcs"]]
-        for mask in range(16):
-            one, _, _ = finite.build_image(
-                group_rows, {pc: mask for pc in group_pcs}, source)
-            one_rows = {int(row["pc"], 16): row
-                        for row in finite.score_image(group_rows, one)["pcs"]}
-            for pc in group_pcs:
-                scores.append((pc, mask, one_rows.get(pc, {"corrected": 0, "harmed": 0})))
-    selected, selection = finite.choose_best(scores)
-    metadata, image, builder = finite.build_image(rows, selected, source)
-    write_json(output / "metadata.json", metadata)
-    (output / "hint-v3.bin").write_bytes(image)
-    if (CONTRACT.pack_image(metadata) != image or
-            sha(output / "hint-v3.bin") != builder["image_sha256"] or
-            source["checkpoint_sha256"] != identity["checkpoint_sha256"] or
-            source["builder_sha256"] != sha(Path(finite.__file__))):
-        raise ValueError("finite image/provenance audit failed before RTL replay")
-    write_json(output / "builder.json", builder)
-    write_json(output / "selection.json", selection)
-    write_json(output / "fixed-conf3-estimate.json", finite.score_image(rows, metadata))
-    write_json(output / "source.json", source)
-    if through == "build":
-        write_json(output / "runs.json", runs)
-        return {"runs": runs, "selected": len(selected)}
-    replay = output / "hint" / "replay.jsonl.gz"
-    runs.append(run_emu("hint", output / "hint", "hint", cpt, restore, flash, ref,
-                        warmup, measure, image=output / "hint-v3.bin",
-                        replay=replay))
-    write_json(output / "replay-report.json", replay_report(replay))
-    if build_identity(emu, ref, restore, flash, cpt) != identity:
-        raise ValueError("RTL source or executable identity changed during pipeline")
-    write_json(output / "runs.json", runs)
-    return {"runs": runs, "selected": len(selected)}
+    baseline, _ = run_emu(output / "baseline", "off", checkpoint, deps, warmup_insts, measure_insts)
+    runs.append(baseline)
+    discovery, trace = run_emu(output / "discovery", "discover", checkpoint, deps, warmup_insts, measure_insts)
+    runs.append(discovery)
+    discovery["baseline_cycle_difference"] = discovery["measure_cycles"] - baseline["measure_cycles"]
+    meta = trace_meta(trace, "discovery")
+    selected_discovery = output / "discovery-selected.bin"
+    choices = hint_cam58.select_discovery(trace, meta, selected_discovery)
+    selected_meta = trace_meta(selected_discovery, "discovery")
+    cam, cam_image = output / "cam.json", output / "cam.bin"
+    public_cam_image = output / "cam.public.bin"
+    # Public selection ranks each window's total baseline misses, not just its winning CFI.
+    public_tool("select-cam", cam, trace, meta, image=public_cam_image)
+    selection = hint_cam58.freeze_selection(cam, choices, trace, output / "cam58-selection.json")
+    hint_cam58.adapt_image(public_cam_image, cam, selection, cam_image, "cam")
+    if through != "discovery":
+        detail, trace = run_emu(output / "detail", "profile", checkpoint, deps, warmup_insts, measure_insts, cam_image)
+        runs.append(detail)
+        detail["baseline_cycle_difference"] = detail["measure_cycles"] - baseline["measure_cycles"]
+        meta = trace_meta(trace, "detail", cam)
+        selected_detail = output / "detail-selected.bin"
+        hint_cam58.filter_detail(trace, meta, cam, selection, selected_detail)
+        selected_meta = trace_meta(selected_detail, "detail", cam)
+        if through != "profile":
+            image = output / "hint.bin"
+            public_image = output / "hint.public.bin"
+            public_tool("build", output / "image.json", selected_detail, selected_meta, cam, public_image)
+            hint_cam58.adapt_image(public_image, cam, selection, image, "load")
+            if through == "hint":
+                hint, _ = run_emu(output / "hint", "hint", checkpoint, deps, warmup_insts, measure_insts, image)
+                runs.append(hint)
+    if (sha(TOOL) != identity["builder_sha256"] or sha(Path(__file__)) != identity["runner_sha256"] or
+            sha(Path(hint_cam58.__file__)) != identity["cam58_adapter_sha256"]):
+        raise ValueError(f"builder/runner changed during the slice pipeline: {slice_id}")
+    identity["source_identity_verified_after_pipeline"] = True
+    write_json(output / "identity.json", identity)
+    write_json(output / "runs.json", {"slice": slice_id, "runs": runs,
+               "selection_basis": "public unordered static estimate; actual IPC measured separately"})
+    return runs
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", type=Path, default=ROOT / "manifest/smoke-test.json")
+    parser.add_argument("--workloads", type=Path, default=ROOT / "workload/cpython-norvv-uart16550-100m200m-heavy.json")
+    parser.add_argument("--deps", required=True, type=Path)
+    parser.add_argument("--execution-server", required=True, choices=("ps1", "ps2"),
+                        help="trusted outer SSH dispatcher label; actual hostname is also recorded")
     selection = parser.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--slice", help="e.g. scimark_fft_test/26")
-    selection.add_argument("--all", action="store_true", help="run all five manifest slices")
+    selection.add_argument("--slice", help="bench/point, e.g. scimark_fft/51")
+    selection.add_argument("--all", action="store_true")
+    parser.add_argument("--checkpoint", type=Path, help="explicit checkpoint file for a single slice")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--through", choices=("discovery", "profile", "build", "hint"),
-                        default="hint")
-    parser.add_argument("--warmup", type=int, default=1_000_000)
-    parser.add_argument("--measure", type=int, default=1_000_000)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--jobs", type=int, default=1,
-                        help="parallel slices; each slice retains baseline/discovery/profile/build order")
+    parser.add_argument("--jobs", type=int, default=1, help="parallel independent slices, capped by startup memory/CPU budget")
+    parser.add_argument("--through", choices=("discovery", "profile", "build", "hint"), default="hint")
     args = parser.parse_args()
-    if args.warmup <= 0 or args.measure <= 0 or args.jobs <= 0:
-        parser.error("warmup, measure and jobs must be positive")
-    if args.all:
-        workloads = json.loads(
-            (ROOT / "manifest" / config()["workload_manifest"]).resolve().read_text())
-        ids = [f"{row['bench']}_test/{point}"
-               for row in workloads["cpts"] for point in row["cpt_list"]]
-        if len(ids) != 5 or len(set(ids)) != 5:
-            raise ValueError("formal RTL report requires exactly five unique slices")
-    else:
-        ids = [args.slice]
+    config = json.loads(args.manifest.read_text())
+    warmup_insts, measure_insts = config["warmup_insts"], config["measure_insts"]
+    if any(type(value) is not int or value <= 0 for value in (warmup_insts, measure_insts)):
+        parser.error("manifest warmup_insts and measure_insts must be positive integers")
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
+    if args.all and args.checkpoint:
+        parser.error("--checkpoint requires --slice")
+    workloads = json.loads(args.workloads.read_text())
+    declared = [f"{row['bench']}/{point}" for row in workloads["cpts"] for point in row["cpt_list"]]
+    ids = declared if args.all else [args.slice.replace("_test/", "/")]
+    if any(slice_id not in declared for slice_id in ids):
+        parser.error("slice not declared by the current workload manifest")
+    deps = json.loads(args.deps.read_text())
+    root = deps.get("checkpoint_root", workloads["workload_root"])
+    if root.startswith("ps1:"):
+        root = root[4:]
+    root = Path(root).expanduser()
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=True)
+    write_json(args.output / "manifest-snapshot.json", config)
+    budget = resource_budget(args.jobs, len(ids))
+    budget["execution_server"] = args.execution_server
+    write_json(args.output / "resource-budget.json", budget)
+    if budget["effective_jobs"] < 1:
+        parser.error("insufficient startup memory/CPU budget; see resource-budget.json")
+    checkpoints = {}
+    for slice_id in ids:
+        bench, point = slice_id.split("/")
+        if args.checkpoint:
+            checkpoint = args.checkpoint.resolve()
+        else:
+            choices = set()
+            for directory in (root / f"{bench}_test" / point, root / bench / point):
+                if directory.is_dir():
+                    choices.update(path.resolve() for path in directory.rglob("*_memory_.zstd"))
+            if len(choices) != 1:
+                parser.error(f"expected exactly one checkpoint for {slice_id}; supply --checkpoint")
+            checkpoint = choices.pop()
+        checkpoints[slice_id] = checkpoint
     results = {}
-    with ThreadPoolExecutor(max_workers=min(args.jobs, len(ids))) as pool:
-        futures = {
-            pool.submit(run_slice, workload_id,
-                        args.output.resolve() / workload_id.replace("/", "_"),
-                        args.warmup, args.measure, args.through, args.dry_run): workload_id
-            for workload_id in ids
-        }
-        for future in as_completed(futures):
-            workload_id = futures[future]
-            results[workload_id] = future.result()
-            print(json.dumps({workload_id: results[workload_id]}, indent=2), flush=True)
+    with ThreadPoolExecutor(max_workers=budget["effective_jobs"]) as pool:
+        pending = {pool.submit(run_slice, slice_id, checkpoint,
+                               args.output / slice_id.replace("/", "_"), deps,
+                               args.through, args.execution_server, budget, warmup_insts, measure_insts): slice_id
+                   for slice_id, checkpoint in checkpoints.items()}
+        for future in as_completed(pending):
+            slice_id = pending[future]
+            results[slice_id] = future.result()
+            write_json(args.output / "summary.json", results)
+    print(json.dumps(results, indent=2))
     return 0
 
 

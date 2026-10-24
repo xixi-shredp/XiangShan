@@ -58,29 +58,32 @@ class CommittedIndirectDpi extends ExtModule with HasExtModuleInline {
     val ftqTag = Input(UInt(32.W))
     val offset = Input(UInt(32.W))
     val queryCycle = Input(UInt(64.W))
+    // Keep this last in the flattened ExtModule ABI, matching the C++ shim.
+    // debug instr is decompressed; architectural width comes from retirement.
+    val isRVC = Input(Bool())
   })
   val cppExtModule = """
     |void CommittedIndirectDpi(uint8_t io_valid, uint64_t io_pc, uint64_t io_actual,
     | uint64_t io_baselineTarget, uint8_t io_baselineValid, uint64_t io_finalTarget,
     | uint8_t io_finalValid, uint8_t io_usedHint, uint8_t io_metadataValid,
-     | uint64_t io_ordinal, uint32_t io_instr, uint32_t io_ftqTag, uint32_t io_offset, uint64_t io_queryCycle) {
+     | uint64_t io_ordinal, uint32_t io_instr, uint32_t io_ftqTag, uint32_t io_offset, uint64_t io_queryCycle, uint8_t io_isRVC) {
     | if (io_valid) h2p_global_commit(io_pc, io_actual, io_baselineTarget, io_baselineValid,
     |   io_finalTarget, io_finalValid, io_usedHint, io_metadataValid, io_ordinal,
-     |   io_instr, io_ftqTag, io_offset, io_queryCycle);
+     |   io_instr, io_ftqTag, io_offset, io_queryCycle, io_isRVC);
     |}
     |""".stripMargin
   difftest.DifftestModule.createCppExtModule("CommittedIndirectDpi", cppExtModule, Some("\"hint_runtime.h\""))
   setInline(s"$desiredName.v", """
     |import "DPI-C" function void h2p_global_commit(input longint pc, actual, baselineTarget,
     | input bit baselineValid, input longint finalTarget, input bit finalValid, usedHint, metadataValid,
-     | input longint ordinal, input int unsigned instr, ftqTag, offset, input longint unsigned queryCycle);
+     | input longint ordinal, input int unsigned instr, ftqTag, offset, input longint unsigned queryCycle, input bit isRVC);
     |module CommittedIndirectDpi(input clock, io_valid, input [63:0] io_pc, io_actual,
     | io_baselineTarget, input io_baselineValid, input [63:0] io_finalTarget,
     | input io_finalValid, io_usedHint, io_metadataValid, input [63:0] io_ordinal,
-     | input [31:0] io_instr, io_ftqTag, io_offset, input [63:0] io_queryCycle);
+     | input [31:0] io_instr, io_ftqTag, io_offset, input [63:0] io_queryCycle, input io_isRVC);
     | always @(posedge clock) if (io_valid) h2p_global_commit(io_pc, io_actual,
     |   io_baselineTarget, io_baselineValid, io_finalTarget, io_finalValid, io_usedHint,
-     |   io_metadataValid, io_ordinal, io_instr, io_ftqTag, io_offset, io_queryCycle);
+     |   io_metadataValid, io_ordinal, io_instr, io_ftqTag, io_offset, io_queryCycle, io_isRVC);
     |endmodule
     |""".stripMargin)
 }

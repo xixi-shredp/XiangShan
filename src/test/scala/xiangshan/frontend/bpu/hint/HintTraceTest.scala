@@ -20,7 +20,7 @@ class HintTraceTest extends AnyFlatSpec with ChiselSim {
     case _=>throw new IllegalArgumentException("unhandled trace field "+x)
   }
   behavior of "Commit trace compact format and bounded transport"
-  it should "encode exact 6B and 22B records and stop only after draining a final sentinel" in {
+  it should "encode exact 7B and 22B records and stop only after draining a final sentinel" in {
     simulate(new HintTraceQueue) { m =>
       m.io.clear.poke(false.B);m.io.collect.poke(false.B);m.io.discovery.poke(true.B)
       m.io.stop.poke(false.B);m.io.discoveryEvent.valid.poke(false.B)
@@ -41,7 +41,7 @@ class HintTraceTest extends AnyFlatSpec with ChiselSim {
           println(s"HINT_TRACE_OBSERVED kind=$kind word=${m.io.out.bits.data.peek().litValue.toString(16)}")
           m.clock.step()
         }
-        val finalWord=BigInt(1)<<(if(m.io.discovery.peek().litToBoolean)47 else 172)
+        val finalWord=BigInt(1)<<(if(m.io.discovery.peek().litToBoolean)54 else 172)
         var wait=0
         while(!m.io.out.valid.peek().litToBoolean && wait<4){m.clock.step();wait+=1}
         m.io.out.valid.expect(true.B);m.io.out.bits.data.expect(finalWord.U)
@@ -55,16 +55,21 @@ class HintTraceTest extends AnyFlatSpec with ChiselSim {
       m.io.discoveryEvent.bits.actualPc.poke(pc.U);m.io.discoveryEvent.bits.eligible.poke(true.B)
       m.io.discoveryEvent.bits.baselineMiss.poke(false.B);m.io.discoveryEvent.valid.poke(true.B)
       m.clock.step();m.io.occupancy.expect(0.U) // Discovery collects target misses only.
-      m.io.discoveryEvent.bits.baselineMiss.poke(true.B);m.clock.step()
-      m.io.discoveryEvent.valid.poke(false.B);m.io.out.bits.data.expect((pc>>1).U)
-      drain(Seq(pc>>1));m.io.overflow.expect(false.B)
+      m.io.discoveryEvent.bits.baselineMiss.poke(true.B)
+      m.io.discoveryEvent.bits.queryStartPc.poke((pc-10).U)
+      // Missing trustworthy query identity must not emit a fabricated Discovery row.
+      m.io.discoveryEvent.bits.queryValid.poke(false.B);m.clock.step();m.io.occupancy.expect(0.U)
+      m.io.discoveryMissingStart.expect(1.U)
+      m.io.discoveryEvent.bits.queryValid.poke(true.B);m.clock.step()
+      m.io.discoveryEvent.valid.poke(false.B);m.io.out.bits.data.expect(((pc>>1)|(BigInt(5)<<47)).U)
+      drain(Seq((pc>>1)|(BigInt(5)<<47)));m.io.overflow.expect(false.B)
 
       clear(false)
       val event=m.io.detailEvent.bits
       event.eligible.poke(true.B);event.pcId.poke(13.U);event.actualTarget.poke(pc.U)
       event.actualPc.poke(0x1000.U);event.queryStartPc.poke(0x100a.U) // delta=-5
       event.queryValid.poke(true.B);event.baselineMiss.poke(true.B)
-      val contexts=Vector(BigInt("1234567",16),BigInt("78",16),BigInt("3456789",16),BigInt("456789a",16))
+      val contexts=Vector(BigInt("1234567",16),BigInt("abcdef0",16),BigInt("3456789",16),BigInt("456789a",16))
       event.ith.poke(contexts(0).U);event.lhr.poke(contexts(1).U)
       event.call.poke(contexts(2).U);event.ret.poke(contexts(3).U)
       val packed=BigInt(13)|((pc>>1)<<4)|(contexts(0)<<51)|(contexts(1)<<79)|
@@ -73,7 +78,7 @@ class HintTraceTest extends AnyFlatSpec with ChiselSim {
       event.queryValid.poke(false.B);event.baselineMiss.poke(false.B);m.clock.step()
       val invalid=BigInt(13)|((pc>>1)<<4)|(BigInt(123)<<163)
       drain(Seq(packed,invalid));m.io.overflow.expect(false.B)
-      println("HINT_TRACE_COMPACT_REAL_RTL_PASS little_endian_bits=1 discovery_bytes=6 detail_bytes=22 delta=-5 query_invalid_zero_context_real_delta=1 final_drained=1")
+      println("HINT_TRACE_COMPACT_REAL_RTL_PASS little_endian_bits=1 discovery_bytes=7 detail_bytes=22 delta=-5 query_invalid_zero_context_real_delta=1 final_drained=1")
 
       clear(false);event.queryValid.poke(true.B);event.baselineMiss.poke(true.B)
       m.io.detailEvent.valid.poke(true.B)

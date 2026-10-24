@@ -3,56 +3,41 @@ package xiangshan.frontend.ftq
 import chisel3._
 import xiangshan.frontend.bpu.hint.HintTraceResolved
 
-/** Stateless actual-CFI survival rules shared by FTQ and its module tests.
-  * The caller supplies existing resolve-order perf metadata; no history,
-  * prediction, pointer, or additional generation state is stored here.
+/** Actual FTQ prefix, retained in the existing resolve metadata.
+  * valid identifies a known terminal boundary; eligible distinguishes an actual
+  * taken indirect from a non-profiled taken branch or a misprediction boundary.
+  * Keeping the latter prevents a late wrong-path resolve from refilling a suffix.
   */
 object HintTracePrefix {
+  def within(previous: HintTraceResolved, offset: UInt): Bool =
+    !previous.valid || offset <= previous.offset
+
+  def fresh(previous: HintTraceResolved, offset: UInt, sameGeneration: Bool,
+      killed: Bool, earlierBoundary: Bool): Bool =
+    sameGeneration && !killed && within(previous, offset) && !earlierBoundary &&
+      !(previous.valid && previous.eligible && previous.offset === offset)
+
   def resolve(
       previous: HintTraceResolved,
       candidate: HintTraceResolved,
       resolvedValid: Bool,
       sameGeneration: Bool,
       killed: Bool,
+      endsWindow: Bool,
       terminal: Bool,
-      knownMispredict: Bool,
-      cutoff: UInt,
-      candidatePosition: UInt,
-      previousPosition: UInt,
-      candidateCarry: Bool,
-      previousCarry: Bool
+      carry: Bool
   ): HintTraceResolved = {
     val updated = WireInit(previous)
-    val candidateSurvives = !candidateCarry &&
-      (!knownMispredict || candidatePosition <= cutoff)
-    val previousSurvives = previous.valid && !previousCarry &&
-      (!knownMispredict || previousPosition <= cutoff)
-    when(resolvedValid && sameGeneration && !killed) {
-      // An earlier conditional can invalidate a saved indirect terminal.
-      when(!previousSurvives) {
-        updated := 0.U.asTypeOf(chiselTypeOf(previous))
-        updated.generation := previous.generation
-      }
-      when(terminal && candidateSurvives &&
-        (!previousSurvives || candidate.offset <= previous.offset)) {
-        updated := candidate
-        updated.valid := true.B
-        updated.eligible := true.B
-        updated.generation := previous.generation
-      }
+    when(resolvedValid && sameGeneration && !killed && !carry && endsWindow &&
+      within(previous, candidate.offset)) {
+      updated := candidate
+      updated.valid := true.B
+      updated.eligible := terminal
+      updated.generation := previous.generation
     }
     updated
   }
 
-  def commitAllowed(
-      meta: HintTraceResolved,
-      generationMatches: Bool,
-      isCfi: Bool,
-      needIttage: Bool,
-      carry: Bool,
-      knownMispredict: Bool,
-      position: UInt,
-      cutoff: UInt
-  ): Bool = meta.valid && generationMatches && !carry && isCfi && needIttage &&
-    (!knownMispredict || position <= cutoff)
+  def commitAllowed(meta: HintTraceResolved, generationMatches: Bool, carry: Bool): Bool =
+    meta.valid && meta.eligible && generationMatches && !carry
 }

@@ -218,7 +218,11 @@ class BpuPrediction(implicit p: Parameters) extends BpuBundle {
 
 // Backend & Ftq -> Bpu
 class BpuRedirect(implicit p: Parameters) extends BpuBundle {
-  // BpuRedirect need the virtual address of the control flow instruction (cfiPc) instead of startPc in other bundles
+  // Reuse the resident FTQ window identity for exact Hint CAM recovery. This
+  // is a combinational forwarding field, not another PC stored in the FTQ.
+  val startPc:   GuardedPc       = GuardedPc()
+  // cfiPc uses the existing PHR/end-halfword coordinate; trace source PCs use
+  // the instruction's first halfword and must not substitute this coordinate.
   val cfiPc:     Pc              = Pc()
   val target:    GuardedPc       = GuardedPc()
   val taken:     Bool            = Bool()

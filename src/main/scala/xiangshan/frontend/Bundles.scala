@@ -39,7 +39,7 @@ import xiangshan.frontend.bpu.BpuRedirect
 import xiangshan.frontend.bpu.BpuTrain
 import xiangshan.frontend.bpu.BranchAttribute
 import xiangshan.frontend.bpu.BranchInfo
-import xiangshan.frontend.bpu.hint.{HintResolve, HintTraceCommit}
+import xiangshan.frontend.bpu.hint.{HintResolve, HintTraceCommit, HintOwner}
 import xiangshan.frontend.ibuffer.IBufPtr
 import xiangshan.frontend.icache.HasICacheParameters
 import xiangshan.frontend.icache.ICacheCacheLineHelper
@@ -55,6 +55,7 @@ class BpuToFtqIO(implicit p: Parameters) extends FrontendBundle {
   val prediction: DecoupledIO[BpuPrediction] = Decoupled(new BpuPrediction)
   val meta:       DecoupledIO[BpuMeta]       = Decoupled(new BpuMeta)
   val s3FtqPtr:   FtqPtr                     = Output(new FtqPtr)
+  val hintAllocation = Output(Valid(UInt(4.W)))
 
   // perfMeta uses the same valid signal as meta
   val perfMeta:       BpuPerfMeta           = Output(new BpuPerfMeta)
@@ -67,6 +68,7 @@ class FtqToBpuIO(implicit p: Parameters) extends FrontendBundle {
   val commit:          Valid[BpuCommit]      = Valid(new BpuCommit)
   val bpuPtr:          FtqPtr                = Output(new FtqPtr)
   val redirectFromIFU: Bool                  = Output(Bool())
+  val hintOwners = Output(Vec(FtqSize, new HintOwner))
   val hintCommit: Valid[FtqPtr] = Valid(new FtqPtr)
   val hintTraceCommit = Valid(new HintTraceCommit)
   val hintResolve: Vec[Valid[HintResolve]] =

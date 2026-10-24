@@ -70,7 +70,6 @@ import xiangshan.frontend.instruncache.InstrUncache
 import xiangshan.frontend.simfrontend.SimFrontendInlinedImp
 import xiangshan.frontend.bpu.hint.HintDpi
 import xiangshan.frontend.bpu.hint.{HintProfileDpi, HintTraceDpi, HintTraceQueue}
-import xiangshan.frontend.bpu.hint.HintReplayDpi
 
 class FrontendIO(implicit p: Parameters) extends FrontendBundle {
   val hartId:       UInt             = Input(UInt(hartIdLen.W))
@@ -175,7 +174,12 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
     val wasCollecting = RegNext(hintDpi.io.profile && hintDpi.io.measure, false.B)
     val wasProfiling = RegNext(hintDpi.io.profile, false.B)
     traceQueue.io.clear := hintDpi.io.profile && !wasProfiling
-    traceQueue.io.collect := hintDpi.io.profile && hintDpi.io.measure
+    // The independent retirement observer reaches the warmup boundary after
+    // the core. Preserve genuine FIFO packets from warmup as well, then let the
+    // transport select the exact independently checked retirement ordinals.
+    // Gating this sink with the delayed measure signal can lose the first
+    // measured branches; emitCommitTrace already excludes all warmup records.
+    traceQueue.io.collect := hintDpi.io.profile
     traceQueue.io.discovery := hintDpi.io.traceMode === 1.U
     traceQueue.io.stop := wasCollecting && !hintDpi.io.measure
     traceQueue.io.discoveryEvent := bpu.io.hintTraceCommit
@@ -190,6 +194,7 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
     traceDpi.io.queryCycle := traceQueue.io.out.bits.queryCycle.get
     traceDpi.io.overflow := traceQueue.io.overflow
     traceDpi.io.occupancy := traceQueue.io.occupancy
+    traceDpi.io.discoveryMissingStart := traceQueue.io.discoveryMissingStart
     // The existing simulation identity journal remains separate from packed
     // hardware records. It carries actual baseline values, never fabricated.
     val hintProfileDpi = Module(new HintProfileDpi)
@@ -209,24 +214,6 @@ class FrontendInlinedImp(outer: FrontendInlined) extends FrontendInlinedImpBase(
     hintProfileDpi.io.ret := Mux(bpu.io.hintProfileEvent.bits.queryValid, bpu.io.hintProfileEvent.bits.ret, 0.U)
     hintProfileDpi.io.eligible := bpu.io.hintProfileEvent.bits.queryValid
     hintProfileDpi.io.observed := true.B
-    val hintReplayDpi = Module(new HintReplayDpi)
-    hintReplayDpi.io.clock := clock
-    hintReplayDpi.io.valid := bpu.io.hintReplayEvent.valid
-    hintReplayDpi.io.pc := bpu.io.hintReplayEvent.bits.pc
-    hintReplayDpi.io.actual := bpu.io.hintReplayEvent.bits.actual
-    hintReplayDpi.io.baselineTarget := bpu.io.hintReplayEvent.bits.baselineTarget
-    hintReplayDpi.io.finalTarget := bpu.io.hintReplayEvent.bits.finalTarget
-    hintReplayDpi.io.usedHint := bpu.io.hintReplayEvent.bits.usedHint
-    hintReplayDpi.io.contextHit := bpu.io.hintReplayEvent.bits.contextHit
-    hintReplayDpi.io.confAtPrediction := bpu.io.hintReplayEvent.bits.confAtPrediction
-    hintReplayDpi.io.ftqTag := bpu.io.hintReplayEvent.bits.ftqTag
-    hintReplayDpi.io.queryCycle := bpu.io.hintReplayEvent.bits.queryCycle
-    hintReplayDpi.io.ith := bpu.io.hintReplayEvent.bits.ith
-    hintReplayDpi.io.lhr := bpu.io.hintReplayEvent.bits.lhr
-    hintReplayDpi.io.call := bpu.io.hintReplayEvent.bits.call
-    hintReplayDpi.io.ret := bpu.io.hintReplayEvent.bits.ret
-    hintReplayDpi.io.mask := bpu.io.hintReplayEvent.bits.mask
-    hintReplayDpi.io.contextHash := bpu.io.hintReplayEvent.bits.contextHash
   } else {
     bpu.io.hintLoad.valid := false.B
     bpu.io.hintLoad.bits := 0.U.asTypeOf(bpu.io.hintLoad.bits)

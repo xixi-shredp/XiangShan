@@ -68,6 +68,8 @@ class HintQueryV4Dpi extends BlackBox with HasBlackBoxInline {
     val lhr = Input(UInt(28.W))
     val call = Input(UInt(28.W))
     val ret = Input(UInt(28.W))
+    val mask = Input(UInt(4.W))
+    val contextHash = Input(UInt(28.W))
   })
   setInline("HintQueryV4Dpi.sv", """
 module HintQueryV4Dpi (
@@ -76,18 +78,19 @@ module HintQueryV4Dpi (
   input logic [63:0] queryCycle, startPc, candidatePc,
   input logic [3:0] pcId,
   input logic candidate, lookupFire, s3Eligible, admission,
-  input logic [27:0] ith, lhr, call, ret
+  input logic [27:0] ith, lhr, call, ret, contextHash,
+  input logic [3:0] mask
 );
   import "DPI-C" function void h2p_hint_query_v4(
     input int unsigned stage, ftqTag,
     input longint unsigned queryCycle, startPc, candidatePc,
     input int unsigned pcId,
     input bit candidate, lookupFire, s3Eligible, admission,
-    input int unsigned ith, lhr, call, ret);
+    input int unsigned ith, lhr, call, ret, mask, contextHash);
   always @(posedge clock) if (valid)
     h2p_hint_query_v4({31'b0, stage}, {25'b0, ftqTag}, queryCycle, startPc, candidatePc,
       {28'b0, pcId}, candidate, lookupFire, s3Eligible, admission,
-      {4'b0, ith}, {4'b0, lhr}, {4'b0, call}, {4'b0, ret});
+      {4'b0, ith}, {4'b0, lhr}, {4'b0, call}, {4'b0, ret}, {28'b0, mask}, {4'b0, contextHash});
 endmodule
 """)
 }

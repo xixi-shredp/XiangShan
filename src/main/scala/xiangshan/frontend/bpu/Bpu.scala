@@ -31,11 +31,10 @@ import xiangshan.frontend.BpuToFtqIO
 import xiangshan.frontend.FrontendTopDownBundle
 import xiangshan.frontend.FtqToBpuIO
 import xiangshan.frontend.GuardedPcInit
-import xiangshan.frontend.bpu.hint.Hint
+import xiangshan.frontend.bpu.hint.{Hint, HintCfiSelection, HintPredictionDiff}
 import xiangshan.frontend.bpu.hint.HintLoadCmd
 import xiangshan.frontend.bpu.hint.{HintTraceCommit, HintTraceFoldEvent, HintTraceResolved}
 import xiangshan.frontend.bpu.hint.HintStats
-import xiangshan.frontend.bpu.hint.HintReplayEvent
 import xiangshan.frontend.PrunedAddr
 import xiangshan.frontend.bpu.abtb.AheadBtb
 import xiangshan.frontend.bpu.history.commonhr.CommonHR
@@ -66,7 +65,6 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
     val hintProfileEvent = Output(Valid(new HintTraceFoldEvent))
     val hintTraceCommit = Output(Valid(new HintTraceCommit))
     val hintStats = Output(new HintStats)
-    val hintReplayEvent = Output(Valid(new HintReplayEvent))
   }
 
   val io: BpuIO = IO(new BpuIO)
@@ -93,12 +91,13 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   hint.io.measureActive := io.hintMeasureActive
   hint.io.redirect := io.fromFtq.redirect
   hint.io.commit := io.fromFtq.hintCommit
+  hint.io.owners := io.fromFtq.hintOwners
+  io.toFtq.hintAllocation := hint.io.allocation
   hint.io.traceCommit := io.fromFtq.hintTraceCommit
   io.hintTraceCommit := io.fromFtq.hintTraceCommit
   hint.io.resolve := io.fromFtq.hintResolve
   io.hintProfileEvent := hint.io.profileEvent
   io.hintStats := hint.io.stats
-  io.hintReplayEvent := hint.io.replayEvent
 
   private def predictors: Seq[BasePredictor] = Seq(
     fallThrough,
@@ -457,11 +456,6 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   private val s3_firstTakenBranch   = Mux1H(s3_firstTakenBranchOH, s3_mbtbResult)
   private val s3_useRas             = s3_firstTakenBranch.bits.attribute.isReturn
   private val s3_useIttage          = s3_firstTakenBranch.bits.attribute.needIttage && ittage.io.prediction.hit
-  private val s3_hintCfiPc = getCfiPcFromPosition(s3_startPc.get, s3_firstTakenBranch.bits.cfiPosition)
-  private val s3_useHint = s3_taken && s3_firstTakenBranch.bits.attribute.needIttage &&
-    hint.io.s3Lookup.usable && s3_hintCfiPc.toUInt.asSInt.pad(64).asUInt === hint.io.s3Lookup.pc
-  hint.io.s3UsedHint := s3_useHint
-
   private val s2_fallThroughPrediction = RegEnable(fallThrough.io.prediction, s1_fire)
   private val s3_fallThroughPrediction = RegEnable(s2_fallThroughPrediction, s2_fire)
 
@@ -479,37 +473,48 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
       s3_taken                   -> s3_firstTakenBranch.bits.target
     )
   )
+  // Preserve the genuine pre-CAM BPU result for Discovery/Detail statistics.
+  private val s3_originalPrediction = Wire(new Prediction)
+  s3_originalPrediction := Mux(s3_taken, s3_firstTakenBranch.bits, s3_fallThroughPrediction)
+  s3_originalPrediction.taken := s3_taken
+  s3_originalPrediction.target := s3_baselineTarget
+
+  private val s3_samePositionBtb = VecInit(s3_mbtbResult.map(e =>
+    e.valid && e.bits.cfiPosition === hint.io.s3Lookup.position))
+  private val s3_samePositionBtbOH = PriorityEncoderOH(s3_samePositionBtb.asUInt)
+  private val hintSelection = Module(new HintCfiSelection)
+  hintSelection.io.original := s3_originalPrediction
+  hintSelection.io.classify := hint.io.s3Lookup.classify
+  hintSelection.io.position := hint.io.s3Lookup.position
+  hintSelection.io.isCall := hint.io.s3Lookup.isCall
+  hintSelection.io.ittageHit := ittage.io.prediction.hit
+  hintSelection.io.ittageTarget := ittage.io.prediction.target
+  hintSelection.io.btbTarget.valid := s3_samePositionBtb.asUInt.orR
+  hintSelection.io.btbTarget.bits := Mux1H(s3_samePositionBtbOH,
+    s3_mbtbResult.map(_.bits.target))
+  hintSelection.io.fallThroughTarget := s3_fallThroughPrediction.target
+  hintSelection.io.hintUsable := hint.io.s3Lookup.usable
+  hintSelection.io.hintTarget := GuardedPcInit(hint.io.s3Lookup.target(GuardedVAddrBits - 1, 0))
+  private val s3_camSelected = hintSelection.io.camSelected
+  private val s3_useHint = hintSelection.io.usedHint
+  s3_prediction := hintSelection.io.prediction
+  private val s3_hintCfiPc = getCfiPcFromPosition(s3_startPc.get, s3_prediction.cfiPosition)
+  hint.io.s3UsedHint := s3_useHint
   hint.io.s3BaselineTarget := s3_baselineTarget.toUInt.asSInt.pad(64).asUInt
-  s3_prediction       := Mux(s3_taken, s3_firstTakenBranch.bits, s3_fallThroughPrediction)
-  s3_prediction.taken := s3_taken
-  s3_prediction.target :=
-    MuxCase(
-      s3_baselineTarget,
-      Seq(
-        (s3_taken && s3_useRas)    -> ras.io.topRetAddr,
-        s3_useHint                 -> GuardedPcInit(hint.io.s3Lookup.target(GuardedVAddrBits - 1, 0)),
-        (s3_taken && s3_useIttage) -> ittage.io.prediction.target,
-        s3_taken                   -> s3_firstTakenBranch.bits.target
-      )
-    )
+  hint.io.s3Observation.foreach { observation =>
+    observation.original := s3_originalPrediction
+    observation.camSelected := s3_camSelected
+    observation.ittageHit := ittage.io.prediction.hit
+    observation.ittageTarget := ittage.io.prediction.target.toUInt.asSInt.pad(64).asUInt
+    observation.btbTargetValid := hintSelection.io.btbTarget.valid
+    observation.btbTarget := hintSelection.io.btbTarget.bits.toUInt.asSInt.pad(64).asUInt
+    observation.fallThroughTarget := s3_fallThroughPrediction.target.toUInt.asSInt.pad(64).asUInt
+  }
 
   s3_override := {
-    val takenDiff       = s3_taken =/= s3_s1Prediction.taken
-    val cfiPositionDiff = Mux1H(s3_firstTakenBranchOH, s3_mbtbCfiPositionDiffVec)
-    val attributeDiff   = Mux1H(s3_firstTakenBranchOH, s3_mbtbAttributeDiffVec)
-    val targetDiff =
-      MuxCase(
-        false.B, // fall-through
-        Seq(
-          (s3_taken && s3_useRas)    -> s3_rasTargetDiff,
-          s3_useHint                 -> (hint.io.s3Lookup.target =/= s3_s1Prediction.target.toUInt.asSInt.pad(64).asUInt),
-          (s3_taken && s3_useIttage) -> s3_ittageTargetDiff,
-          s3_taken                   -> Mux1H(s3_firstTakenBranchOH, s3_mbtbTargetDiffVec)
-        )
-      )
-
-    diagnosticOverrideReason.foreach(_ := Cat(targetDiff, attributeDiff, cfiPositionDiff, takenDiff))
-    s3_valid && (takenDiff || cfiPositionDiff || attributeDiff || targetDiff)
+    val difference = HintPredictionDiff(s3_prediction, s3_s1Prediction)
+    diagnosticOverrideReason.foreach(_ := difference)
+    s3_valid && difference.orR
   }
 
   private val s2_phrMeta = RegEnable(phr.io.phrMeta, s1_fire)
@@ -654,16 +659,20 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   commonHR.io.s2CfiTargets              := VecInit(mbtb.io.result.map(_.bits.target.unGuard))
   commonHR.io.update.startPc            := s3_startPc.get.unGuard
   commonHR.io.update.target             := s3_prediction.target.unGuard
-  commonHR.io.update.taken              := s3_taken
+  commonHR.io.update.taken              := s3_prediction.taken
+  commonHR.io.update.camSelected        := s3_camSelected
   commonHR.io.update.s3Override         := s3_override
   commonHR.io.update.attributes         := VecInit(s3_mbtbResult.map(_.bits.attribute))
   commonHR.io.update.targets            := VecInit(s3_mbtbResult.map(_.bits.target.unGuard))
   commonHR.io.update.firstTakenBranchOH := s3_firstTakenBranchOH
-  commonHR.io.update.firstTakenBranch   := s3_firstTakenBranch
+  commonHR.io.update.firstTakenBranch.valid := s3_prediction.taken
+  commonHR.io.update.firstTakenBranch.bits := s3_prediction
   commonHR.io.update.position           := VecInit(s3_mbtbResult.map(_.bits.cfiPosition))
   commonHR.io.update.condHitMask        := s3_condHitMask
   commonHR.io.redirect.valid            := redirect.valid
   commonHR.io.redirect.cfiPc            := redirect.bits.cfiPc
+  commonHR.io.redirect.cfiPosition      := getAlignedPosition(redirect.bits.startPc,
+    ((redirect.bits.cfiPc.toUInt - redirect.bits.startPc.toUInt) >> instOffsetBits)(CfiPositionWidth - 1, 0))._1
   commonHR.io.redirect.target           := redirect.bits.target.unGuard
   commonHR.io.redirect.taken            := redirect.bits.taken
   commonHR.io.redirect.attribute        := redirect.bits.attribute
@@ -700,6 +709,10 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
       )
     )
   private val s3_predictionSource = MuxCase(BpuPredictionSource.Stage3.Fallthrough, Seq(
+    s3_useHint -> BpuPredictionSource.Stage3.Hint,
+    (s3_camSelected && ittage.io.prediction.hit) -> BpuPredictionSource.Stage3.ITTage,
+    (s3_camSelected && s3_samePositionBtb.asUInt.orR) -> BpuPredictionSource.Stage3.Mbtb,
+    s3_camSelected -> BpuPredictionSource.Stage3.Fallthrough,
     (s3_taken && s3_useRas) -> BpuPredictionSource.Stage3.Ras,
     s3_useHint -> BpuPredictionSource.Stage3.Hint,
     (s3_taken && s3_useIttage) -> BpuPredictionSource.Stage3.ITTage,
@@ -718,8 +731,7 @@ class Bpu(implicit p: Parameters) extends BpuModule with HalfAlignHelper {
   s3_perfMeta.s1Prediction        := s3_s1Prediction
   s3_perfMeta.s3Prediction        := s3_prediction
   s3_perfMeta.debug_preHintPrediction.foreach { pred =>
-    pred := s3_prediction
-    pred.target := s3_baselineTarget
+    pred := s3_originalPrediction
   }
   s3_perfMeta.debug_usedHint.foreach(_ := s3_useHint)
   s3_perfMeta.debug_hintQueryCycle.foreach { cycle =>

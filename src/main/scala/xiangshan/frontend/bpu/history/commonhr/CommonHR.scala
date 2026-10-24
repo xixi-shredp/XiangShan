@@ -112,6 +112,7 @@ class CommonHR(implicit p: Parameters) extends CommonHRModule with Helpers with 
    */
   private val s3_update           = io.update // bp pipeline s3 level update
   private val s3_hitMask          = RegEnable(s2_hitMask, s2_fire)
+  private val s3_positions        = RegEnable(io.s2CfiPositions, s2_fire)
   private val s3_taken            = s3_update.taken
   private val s3_firstTakenPos    = s3_update.firstTakenBranch.bits.cfiPosition
   private val s3_firstTakenIsCond = s3_update.firstTakenBranch.bits.attribute.isConditional
@@ -129,6 +130,17 @@ class CommonHR(implicit p: Parameters) extends CommonHRModule with Helpers with 
   private val s3_bwTakenCandidate = RegEnable(s2_bwTakenCandidate, s2_fire)
 
   private val s3_selectedTakenCommonHR = Mux1H(s3_update.firstTakenBranchOH, s3_takenCommonHR)
+  // A CAM CFI need not exist in any BTB lane. Count deduplicated conditional
+  // branches strictly before its native position, never an old conditional at
+  // that same position which CAM has just reclassified as an indirect.
+  private val s3_camNumLess = PopCount(VecInit(s3_positions.zip(s3_hitMask).map {
+    case (pos, hit) => hit && pos < s3_firstTakenPos
+  }))
+  private val s3_camCommonHR = WireInit(0.U.asTypeOf(new CommonHREntry))
+  s3_camCommonHR.valid := s3_fire
+  s3_camCommonHR.predStartPc.get := s3_update.startPc
+  s3_camCommonHR.ghr := (commonHR.ghr << s3_camNumLess)(GhrHistoryLength - 1, 0)
+  s3_camCommonHR.bw := (commonHR.bw << s3_camNumLess)(BWHistoryLength - 1, 0)
   s3_bwTakenDiff := Mux1H(s3_update.firstTakenBranchOH, s3_bwTakenCandidate)
   XSError(
     s3_override && s3_taken && s3_firstTakenIsCond && s3_bwTaken =/= s3_bwTakenDiff,
@@ -159,8 +171,10 @@ class CommonHR(implicit p: Parameters) extends CommonHRModule with Helpers with 
   s3_defaultCommonHR.ghr             := (commonHR.ghr << s3_numHit)(GhrHistoryLength - 1, 0)
   s3_defaultCommonHR.bw              := (commonHR.bw << s3_numHit)(BWHistoryLength - 1, 0)
 
-  XSError(s3_fire && s3_taken && !s3_update.firstTakenBranchOH.reduce(_ || _), "taken but no firstTakenBranchOH")
-  s3_newCommonHR := Mux(s3_taken, s3_selectedTakenCommonHR, s3_defaultCommonHR)
+  XSError(s3_fire && s3_taken && !s3_update.camSelected &&
+    !s3_update.firstTakenBranchOH.reduce(_ || _), "taken but no firstTakenBranchOH")
+  s3_newCommonHR := Mux(s3_update.camSelected, s3_camCommonHR,
+    Mux(s3_taken, s3_selectedTakenCommonHR, s3_defaultCommonHR))
 
   /*
    * ghr/bw is not involved in prediction during redirect; used here as a placeholder
@@ -188,11 +202,11 @@ class CommonHR(implicit p: Parameters) extends CommonHRModule with Helpers with 
     case (hit, attr) => hit && attr.isConditional
   })
   // TODO:Need pipeline stage for redirect update CommonHR if dedup calc skipped?
-  private val r1_oldHits       = r1_redirect.meta.hitMask
+  private val r1_oldHits       = dedupHitPositions(r1_oldCondHits, r1_oldPositions)
   private val r1_taken         = r1_redirect.taken
   private val r1_isCond        = r1_redirect.attribute.isConditional
   private val r1_bwTaken       = isBackwardBranch(r1_redirect.cfiPc, r1_redirect.target)
-  private val r1_takenPosition = getAlignedInstOffset(r1_redirect.cfiPc)
+  private val r1_takenPosition = r1_redirect.cfiPosition
   private val r1_lessThanPc = r1_oldPositions.zip(r1_oldHits).map {
     case (pos, hit) => hit && (pos < r1_takenPosition)
   } // positions less than redirect branch pc
@@ -222,7 +236,7 @@ class CommonHR(implicit p: Parameters) extends CommonHRModule with Helpers with 
   private val debug_taken         = io.redirect.taken
   private val debug_isCond        = io.redirect.attribute.isConditional
   private val debug_bwTaken       = isBackwardBranch(io.redirect.cfiPc, io.redirect.target)
-  private val debug_takenPosition = getAlignedInstOffset(io.redirect.cfiPc)
+  private val debug_takenPosition = io.redirect.cfiPosition
   private val debug_lessThanPc = debug_oldPositions.zip(debug_oldHits).map {
     case (pos, hit) => hit && (pos < debug_takenPosition)
   } // positions less than redirect branch pc
@@ -335,7 +349,9 @@ class CommonHR(implicit p: Parameters) extends CommonHRModule with Helpers with 
     histQueue(recoverPtr.value) := r1_commonHR
   }
 
-  io.s3DedupHitMask := s3_hitMask
+  io.s3DedupHitMask := VecInit(s3_positions.zip(s3_hitMask).map { case (pos, hit) =>
+    hit && !(s3_update.camSelected && pos === s3_firstTakenPos)
+  })
 
   // Use distance-based checks for circular pointers to avoid wrap-around ordering ambiguity.
   private val writeToPredDist   = distanceBetween(writePtr, predPtr)

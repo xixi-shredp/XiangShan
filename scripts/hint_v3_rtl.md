@@ -1,34 +1,31 @@
-# RTL Hint v3 workload pipeline
+# RTL Hint workload smoke pipeline
 
-Build `build/emu` from this checkout. The runner reads
-`../manifest/test.json` and the five slices in `../workload/cpython-heavy.json`.
-It uses the checkpoint's `_memory_.zstd` as `-i`, the manifest's `gcpt_restore`
-as `-r`, the audited six-instruction boot flash as `-F`, and the kmhv3-matched
-NEMU interpreter shared object as `--diff`. Their SHA256 values and the NEMU
-source commit/configuration/build command are in `../results/rtl-v3-nemu/audit.json`.
-The NEMU source configuration enables `CONFIG_RV_SDTRIG` and
-`CONFIG_DIFFTEST_CHECK_SDTRIG`, giving the 1400-byte difftest state required by
-this RTL. The explicit flash is required because this NEMU exports the older
-flash-loading API and its built-in three-instruction image differs from the
-RTL's six-instruction default.
+Run on ps1/ps2. The runner reads `manifest/smoke-test.json` and
+`workload/cpython-norvv-uart16550-100m200m-heavy.json` from the project root.
+Supply `--deps` with audited `emu`, `checkpoint_root`, `gcpt_restore`,
+`boot_flash`, `ref_so`, and `dramsim3_ini` paths. The emulator must already be
+built for `BackendV2NoRVVNoLLCConfig` with the matching NEMU difftest library.
 
 ```sh
-python3 scripts/hint_v3_rtl.py --all --jobs 5 --output /absolute/output/rtl-hint --through build
-python3 scripts/hint_v3_rtl.py --all --jobs 5 --output /absolute/output/rtl-hint --through hint
+python3 rtl/scripts/hint_v3_rtl.py --execution-server ps2 --deps /absolute/deps.json --all --jobs 10 --output /absolute/new-output-directory --through hint
 ```
 
-The first command runs each slice's baseline and independent RTL discovery,
-then profiles all top-20 target-miss PCs in disjoint CAM groups of at most 16.
-It evaluates masks 0–15 with the shared finite builder and writes a v3 JSON
-metadata file, packed image, excluded-PC report, and fixed-confidence estimate.
-The second command revalidates every existing run's command, log, source and
-binary hashes, then performs actual RTL Hint replay. The default run length is
-1M warmup plus 1M measure. `--warmup` and `--measure` permit shorter smoke
-runs; such runs are outside the formal report. `--jobs` runs independent slices
-in parallel while keeping the required pass order inside each slice.
+Each slice runs baseline → Discovery → public CAM selection/load → Detail →
+public table construction/load → Hint, in that order. Independent slices run
+in parallel, capped by available CPU and memory. Output stage directories must
+be new; this runner does not resume or overwrite an existing run.
 
-Each run records NEMU and GCPT helper hashes, the emulator and checkpoint
-hashes, actual instruction/cycle counts, IPC, measurement-window Hint counters,
-and a difftest log. `replay-report.json` contains observed per-PC corrected and
-harmed target predictions from committed RTL events. Its counts are distinct
-from `fixed-conf3-estimate.json`, which is only an offline image estimate.
+`warmup_insts` and `measure_insts` in the smoke manifest determine all four
+emulator runs, the profiling warmup boundary, and the final counter checks.
+The current smoke default is **10,000 warmup + 10,000 measure instructions**:
+`-W 10000 -I 20000 --measure-instr=10000`, with
+`H2P_HINT_WARMUP_INSTR=10000`. The runner also accepts other positive integer
+windows from an explicitly supplied `--manifest`. It records a manifest
+snapshot and both requested and actual counts; whole-cycle instruction
+overshoot is retained. Performance comparisons must identify their window.
+
+Each run records input hashes, commands, environment, exit status, actual
+instructions/cycles, IPC, and Hint counters. The pipeline checks the public
+trace format and tool/runner identity before completing. Preserve existing
+1M/1M runs under their original frozen runner and output directory; start
+10K/10K runs in a separate directory so their results remain distinguishable.

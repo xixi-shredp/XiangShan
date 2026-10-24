@@ -14,6 +14,7 @@ class HintTraceDpi extends BlackBox with HasBlackBoxInline {
     val queryCycle = Input(UInt(64.W))
     val overflow = Input(Bool())
     val occupancy = Input(UInt(5.W))
+    val discoveryMissingStart = Input(UInt(32.W))
   })
   setInline("HintTraceDpi.sv", """
 module HintTraceDpi(
@@ -21,17 +22,19 @@ module HintTraceDpi(
   input logic [175:0] data,
   input logic [6:0] ftqTag,
   input logic [63:0] queryCycle,
-  input logic [4:0] occupancy
+  input logic [4:0] occupancy,
+  input logic [31:0] discoveryMissingStart
 );
   import "DPI-C" function void h2p_hint_trace_sink(
     input bit valid, discovery, overflow,
     input longint unsigned data0, data1, data2,
     input int unsigned ftqTag, occupancy,
-    input longint unsigned queryCycle);
+    input longint unsigned queryCycle,
+    input int unsigned discoveryMissingStart);
   always @(posedge clock)
     h2p_hint_trace_sink(valid, discovery, overflow,
       data[63:0], data[127:64], {16'b0,data[175:128]},
-      {25'b0,ftqTag}, {27'b0,occupancy}, queryCycle);
+      {25'b0,ftqTag}, {27'b0,occupancy}, queryCycle, discoveryMissingStart);
 endmodule
 """)
 }

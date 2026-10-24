@@ -34,6 +34,7 @@ class CommonHREntry(implicit p: Parameters) extends CommonHRBundle {
 class CommonHRUpdate(implicit p: Parameters) extends CommonHRBundle {
   val taken:              Bool                 = Bool()
   val s3Override:         Bool                 = Bool()
+  val camSelected:        Bool                 = Bool()
   val condHitMask:        Vec[Bool]            = Vec(NumBtbResultEntries, Bool())
   val position:           Vec[UInt]            = Vec(NumBtbResultEntries, UInt(CfiPositionWidth.W))
   val attributes:         Vec[BranchAttribute] = Vec(NumBtbResultEntries, new BranchAttribute)
@@ -63,6 +64,7 @@ class CommonHRMeta(implicit p: Parameters) extends CommonHRBundle {
 class CommonHRRedirect(implicit p: Parameters) extends CommonHRBundle {
   val valid:     Bool            = Bool()
   val cfiPc:     Pc              = Pc()
+  val cfiPosition: UInt          = UInt(CfiPositionWidth.W)
   val taken:     Bool            = Bool()
   val attribute: BranchAttribute = new BranchAttribute
   val target:    Pc              = Pc()

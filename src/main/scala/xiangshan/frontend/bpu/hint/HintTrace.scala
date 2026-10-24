@@ -42,7 +42,10 @@ class HintTraceFoldEvent(implicit p: Parameters) extends XSBundle {
   val ret = UInt(28.W)
 }
 
-/** Actual terminal CFI retained inside existing FTQ resolve metadata (58 bits). */
+/** Actual terminal / surviving-prefix boundary in existing resolve metadata (58 bits).
+  * valid marks a known boundary; eligible marks a taken non-return indirect CFI.
+  * Non-profiled boundaries prevent late wrong-path suffix resolves from refilling it.
+  */
 class HintTraceResolved extends Bundle {
   val target = UInt(47.W)
   val offset = UInt(6.W)
@@ -54,7 +57,10 @@ class HintTraceResolved extends Bundle {
 }
 
 object HintTracePacking {
-  def discovery(pc: UInt): UInt = Cat(0.U(1.W), pc(47, 1))
+  def discovery(event: HintTraceCommit): UInt = {
+    val delta = ((event.actualPc.asSInt - event.queryStartPc.asSInt) >> 1).asUInt
+    Cat(0.U(2.W), delta(6, 0), event.actualPc(47, 1))
+  }
   def detail(event: HintTraceFoldEvent): UInt = {
     val delta = ((event.actualPc.asSInt - event.queryStartPc.asSInt) >> 1).asUInt
     Cat(0.U(3.W), 0.U(1.W), event.queryValid, event.baselineMiss,
@@ -86,21 +92,28 @@ class HintTraceQueue(implicit p: Parameters) extends BpuModule {
     val overflow = Output(Bool())
     val stopped = Output(Bool())
     val occupancy = Output(UInt(5.W))
+    val discoveryMissingStart = Output(UInt(32.W))
   })
   val queue = Module(new Queue(new HintTracePacket, 16, pipe = true, flow = false))
   val overflow = RegInit(false.B)
+  val discoveryMissingStart = RegInit(0.U(32.W))
   val stopping = RegInit(false.B)
   val ended = RegInit(false.B)
   val sample = Mux(io.discovery,
-    io.discoveryEvent.valid && io.discoveryEvent.bits.eligible && io.discoveryEvent.bits.baselineMiss,
+    io.discoveryEvent.valid && io.discoveryEvent.bits.eligible && io.discoveryEvent.bits.baselineMiss && io.discoveryEvent.bits.queryValid,
     io.detailEvent.valid && io.detailEvent.bits.eligible)
   val accept = io.collect && !stopping && !io.stop && !io.clear && sample
   // Final follows all accepted records. It is not a branch sample.
+  when(io.collect && io.discovery && !stopping && !io.stop && !io.clear &&
+    io.discoveryEvent.valid && io.discoveryEvent.bits.eligible &&
+    io.discoveryEvent.bits.baselineMiss && !io.discoveryEvent.bits.queryValid) {
+    discoveryMissingStart := discoveryMissingStart + 1.U
+  }
   val finalPending = stopping && !ended && !io.clear
   queue.io.enq.valid := accept || finalPending
   queue.io.enq.bits.data := Mux(finalPending,
-    Mux(io.discovery, (BigInt(1) << 47).U(176.W), (BigInt(1) << 172).U(176.W)),
-    Mux(io.discovery, HintTracePacking.discovery(io.discoveryEvent.bits.actualPc).pad(176),
+    Mux(io.discovery, (BigInt(1) << 54).U(176.W), (BigInt(1) << 172).U(176.W)),
+    Mux(io.discovery, HintTracePacking.discovery(io.discoveryEvent.bits).pad(176),
       HintTracePacking.detail(io.detailEvent.bits)))
   queue.io.enq.bits.ftqTag.foreach(_ := Mux(finalPending, 0.U,
     Mux(io.discovery, io.discoveryEvent.bits.ftqTag, io.detailEvent.bits.ftqTag)))
@@ -108,9 +121,11 @@ class HintTraceQueue(implicit p: Parameters) extends BpuModule {
     Mux(io.discovery, io.discoveryEvent.bits.queryCycle.get, io.detailEvent.bits.queryCycle.get)))
   io.out <> queue.io.deq
   when(accept && !queue.io.enq.ready) { overflow := true.B }
-  when(accept && !io.discovery) {
-    val delta = (io.detailEvent.bits.actualPc.asSInt - io.detailEvent.bits.queryStartPc.asSInt) >> 1
-    assert(!io.detailEvent.bits.actualPc(0) && !io.detailEvent.bits.queryStartPc(0))
+  when(accept) {
+    val pc = Mux(io.discovery, io.discoveryEvent.bits.actualPc, io.detailEvent.bits.actualPc)
+    val start = Mux(io.discovery, io.discoveryEvent.bits.queryStartPc, io.detailEvent.bits.queryStartPc)
+    val delta = (pc.asSInt - start.asSInt) >> 1
+    assert(!pc(0) && !start(0))
     assert(delta >= (-64).S && delta <= 63.S)
   }
   when(io.stop) { stopping := true.B }
@@ -119,10 +134,12 @@ class HintTraceQueue(implicit p: Parameters) extends BpuModule {
   when(io.clear) {
     assert(queue.io.count === 0.U)
     overflow := false.B
+    discoveryMissingStart := 0.U
     stopping := false.B
     ended := false.B
   }
   io.overflow := overflow
   io.stopped := ended && queue.io.count === 0.U
   io.occupancy := queue.io.count
+  io.discoveryMissingStart := discoveryMissingStart
 }
